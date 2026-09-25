@@ -789,20 +789,44 @@ def diff_cells(old, new):
 def diff_objects(old, new):
     for sheet in sorted(set(old) | set(new)):
         o, n = list(old.get(sheet, [])), list(new.get(sheet, []))
-        for item in o:
+        for item in list(o):
             if item in n:
                 n.remove(item)
-            else:
-                yield ("object removed", sheet, "", item, None)
+                o.remove(item)
+        # A removed and an added object that are the same thing (the comment
+        # on A1, table Sales, the only chart) is one changed object.
+        for key in dict.fromkeys(_object_key(i) for i in o):
+            olds = [i for i in o if _object_key(i) == key]
+            news = [i for i in n if _object_key(i) == key]
+            if len(olds) == len(news) == 1:
+                yield ("object changed", sheet, "", olds[0], news[0])
+                o.remove(olds[0])
+                n.remove(news[0])
+        for item in o:
+            yield ("object removed", sheet, "", item, None)
         for item in n:
             yield ("object added", sheet, "", None, item)
 
 
+def _object_key(item):
+    kind, _, rest = item.partition(":")
+    if kind.startswith("comment") or kind in ("chart", "image"):
+        return kind
+    return f"{kind}: {rest.split()[0] if rest.split() else ''}"  # table / pivot table by name
+
+
 def diff(old_path, new_path, markdown=False, title=None):
-    changes = list(diff_cells(read_cells(old_path), read_cells(new_path)))
-    changes += list(diff_objects(describe_objects(Package.open(old_path)),
-                                 describe_objects(Package.open(new_path))))
-    changes = [(k, s, c, o, n, k.startswith("object")) for k, s, c, o, n in changes]
+    old, new = Package.open(old_path), Package.open(new_path)
+    # A renamed sheet keeps its sheetId: compare it under its old name and
+    # report the rename, not a removed sheet plus an added one.
+    renamed = {a: b for a, b in _pair(old.sheets(), new.sheets()).items() if a != b}
+    back = {b: a for a, b in renamed.items()}
+    as_old = lambda d: {back.get(k, k): v for k, v in d.items()}
+    changes = [("sheet renamed", a, "", a, b) for a, b in renamed.items()]
+    changes += list(diff_cells(read_package_cells(old), as_old(read_package_cells(new))))
+    changes += list(diff_objects(describe_objects(old), as_old(describe_objects(new))))
+    changes = [(k, renamed.get(s, s) if k != "sheet renamed" else s, c, o, n, k.startswith(("object", "sheet renamed")))
+               for k, s, c, o, n in changes]
     show = lambda v, raw: "" if v is None else v if raw else fmt(v)
     if markdown:
         print(f"### {title or new_path}\n")
@@ -819,9 +843,14 @@ def diff(old_path, new_path, markdown=False, title=None):
             print(f"\n...and {len(changes) - 500} more.")
         print()
     else:
+        if not changes:
+            print("No cell or object changes (formatting may still differ).")
         for kind, sheet, coord, ov, nv, raw in changes:
-            if raw:  # a chart, table, comment...
-                print(f"{kind:14} {sheet}  {nv if nv is not None else ov}")
+            if kind == "sheet renamed":
+                print(f"{kind:14} {ov} -> {nv}")
+            elif raw:  # a chart, table, comment...
+                what = f"{ov} -> {nv}" if ov is not None and nv is not None else nv if nv is not None else ov
+                print(f"{kind:14} {sheet}  {what}")
             elif not coord:  # a whole sheet
                 print(f"{kind:14} {sheet}")
             else:

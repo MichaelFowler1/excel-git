@@ -249,5 +249,15 @@ def test_diff_reports_chart_changes(tmp_path, capsys):
     xlgit.diff(str(tmp_path / "a.xlsx"), str(tmp_path / "b.xlsx"))
     out = capsys.readouterr().out
     assert "changed        Budget!B2  1000 -> 1100" in out
-    assert "object removed Budget" in out and "'Spending'" in out
-    assert "object added   Budget" in out and "'Spending 2026'" in out
+    # the retitled chart is one change, not a removal plus an addition
+    assert "object changed Budget  chart: barChart 'Spending'" in out and "-> chart: barChart 'Spending 2026'" in out
+    assert "object removed Budget" not in out and "object added   Budget" not in out
+    # the renamed sheet is a rename, with nothing else about it changed
+    assert "sheet renamed  Notes -> Notes 2026" in out
+    assert "Notes 2026!" not in out and "comment" not in out
+
+
+def test_diff_says_when_nothing_changed(tmp_path, capsys):
+    build(tmp_path / "a.xlsx")
+    assert xlgit.diff(str(tmp_path / "a.xlsx"), str(tmp_path / "a.xlsx")) == 0
+    assert "No cell or object changes" in capsys.readouterr().out
