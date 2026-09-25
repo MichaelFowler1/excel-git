@@ -10,7 +10,8 @@ Git and GitHub treat `.xlsx` as an opaque binary blob. You can commit, fork and 
 | Merge, different cells edited | conflict, pick one whole file | merges cleanly |
 | Merge, same cell edited | conflict | conflict on just that cell, listed in a `_merge_conflicts` sheet with a link to it |
 | Charts, images, comments, formatting, macros | n/a | kept, and their edits to them carried over |
-| Pull request on GitHub | "binary file not shown" | bot comment with a table of every changed cell and chart |
+| Tables and pivot tables | n/a | merged: you add rows, they add a column, you get both |
+| Pull request on GitHub | "binary file not shown" | bot comment with a table of every changed cell, chart, table and pivot |
 
 Formulas are compared as formulas (`=B2+C2`), not their cached results.
 
@@ -20,10 +21,14 @@ A workbook is a zip of XML files: one per sheet, one per chart, one per image an
 
 - **Cells**: 3-way merge cell by cell. A cell only one side changed takes that side's value.
 - **Charts, images, comments, macros**: 3-way merge object by object. If only their branch changed a chart, you get their version. If both did, yours is kept and it's flagged as a conflict. Chart edits caused by cell changes (Excel caches plotted values inside the chart) don't count as edits.
-- **Sheets**: new sheets on their branch come over whole, charts included. Renames and deletes merge too.
+- **Tables**: merged field by field. Their new column plus your new rows gives a table with both. Tables added on their branch come over, and if both branches added a `Table2`, theirs is renamed `Table3` and their formulas are updated to match.
+- **Pivot tables**: a pivot, its data cache and the cached records merge as one bundle. A branch that only refreshed a pivot (same layout, new data) doesn't count as an edit, so your data change and their "switch to Average" merge cleanly. New pivots from their branch come over, sharing an existing cache when they used one.
+- **Sheets**: new sheets on their branch come over whole, with their charts, tables and pivots. Renames and deletes merge too.
 - **Named ranges**: merged by name.
 
-Excel recalculates every formula when it opens the merged file.
+Writers renumber a workbook's internal files on every save (add a chart to an early sheet and every later `chart1.xml` becomes `chart2.xml`). xlgit matches objects by what they are, like "the chart called Chart 1 on sheet Notes" or "table id 3", not by file name, so renumbering doesn't cause false conflicts.
+
+Excel recalculates every formula and refreshes affected pivot tables when it opens the merged file.
 
 ## Setup
 
@@ -60,6 +65,8 @@ The tests build workbook versions with charts, comments and named ranges, run re
 
 - Formatting changes their branch made to existing cells come over only when both branches have the same set of styles. Otherwise your formatting is kept.
 - Column widths, merged cells and conditional formatting on existing sheets aren't merged. Yours are kept.
-- Tables and pivot tables added on their branch aren't merged yet. They're reported as conflicts so nothing disappears silently.
+- Until Excel refreshes a merged pivot, the numbers in its cells are the old ones. Excel does this on open, but tools that read the file without Excel (pandas, openpyxl) see the stale values.
+- Slicers, timelines and tables linked to external data connections aren't merged. They're reported as conflicts so nothing disappears silently.
+- If both branches added a chart to a sheet that had none, only yours is kept (flagged).
 - Inserting a row shows up as many changed cells, because every cell below it moves.
 - `.xls` (the old pre-2007 format) isn't supported. Save as `.xlsx`.

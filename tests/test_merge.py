@@ -22,7 +22,8 @@ XLGIT = Path(xlgit.__file__).resolve()
 
 
 def build(path, *, b2=1000, c3=350, title="Spending", budget_chart=True, notes_name="Notes",
-          notes_chart=False, forecast=False, food_name=False, note_text="check with landlord"):
+          notes_chart=False, notes_title="Q1 only", forecast=False, food_name=False,
+          note_text="check with landlord"):
     wb = xlsxwriter.Workbook(str(path))
     bold = wb.add_format({"bold": True})
     money = wb.add_format({"num_format": "$#,##0"})
@@ -50,7 +51,7 @@ def build(path, *, b2=1000, c3=350, title="Spending", budget_chart=True, notes_n
     if notes_chart:
         ch = wb.add_chart({"type": "line"})
         ch.add_series({"categories": "=Budget!$A$2:$A$3", "values": "=Budget!$B$2:$B$3"})
-        ch.set_title({"name": "Q1 only"})
+        ch.set_title({"name": notes_title})
         notes.insert_chart("C2", ch)
     if forecast:
         f = wb.add_worksheet("Forecast")
@@ -187,6 +188,24 @@ def test_their_chart_deletion_merges(repo):
     assert charts(repo.book, "Budget") == []
     assert charts(repo.book, "Notes") == ["Q1 only"]
     assert charts(repo.book, "Forecast") == ["Cash forecast"]
+
+
+def test_renumbered_charts_still_match(tmp_path):
+    """We add a chart on an earlier sheet, so the writer saves our existing
+    Notes chart as chart2.xml instead of chart1.xml. Their edit to that chart
+    must still land on it, with no false conflict."""
+    r = Repo(tmp_path)
+    r.commit("main", "main", budget_chart=False, notes_chart=True)
+    r.commit("ours", "main", budget_chart=True, notes_chart=True)
+    r.commit("theirs", "main", budget_chart=False, notes_chart=True, notes_title="Q1 actuals")
+    with zipfile.ZipFile(r.book) as z:
+        assert "xl/charts/chart2.xml" not in z.namelist()  # theirs: one chart, numbered 1
+    result = r.merge("ours", "theirs")
+    assert result.returncode == 0, result.stdout + result.stderr
+    keep(r.book, "merged_renumbered.xlsx")
+    assert_opens_clean(r.book)
+    assert charts(r.book, "Budget") == ["Spending"]
+    assert charts(r.book, "Notes") == ["Q1 actuals"]
 
 
 def test_their_comment_edit_merges(repo):
