@@ -831,19 +831,150 @@ def textconv(path):
 # ---------- diff ----------
 
 def diff_cells(old, new):
-    """Yield (kind, sheet, coord, old_value, new_value)."""
+    """Yield (kind, sheet, coord, old_value, new_value). Inserted, deleted and
+    moved rows are reported as rows, not as every cell below them changing."""
     for sheet in sorted(set(old) | set(new)):
         if sheet not in old:
             yield ("sheet added", sheet, "", None, None)
         elif sheet not in new:
             yield ("sheet removed", sheet, "", None, None)
             continue
-        o, n = old.get(sheet, {}), new.get(sheet, {})
-        for coord in sorted(set(o) | set(n), key=_cell_sort_key):
-            ov, nv = o.get(coord), n.get(coord)
-            if not same(ov, nv):
-                kind = "added" if ov is None else "removed" if nv is None else "changed"
-                yield (kind, sheet, coord, ov, nv)
+        yield from ((k, sheet, c, a, b) for k, c, a, b in diff_sheet(old.get(sheet, {}), new.get(sheet, {})))
+
+
+def diff_sheet(o, n):
+    """[(kind, coord, old, new)] for one sheet's cells."""
+    plain = [("added" if ov is None else "removed" if nv is None else "changed", coord, ov, nv)
+             for coord in sorted(set(o) | set(n), key=_cell_sort_key)
+             for ov, nv in [(o.get(coord), n.get(coord))] if not same(ov, nv)]
+    if not plain:
+        return plain
+    aligned = _aligned_diff(_by_row(o), _by_row(n))
+    # Rows only help when they explain the change more simply.
+    if aligned is None or _cost(aligned) >= len(plain):
+        return plain
+    return aligned
+
+
+ROW_EVENTS = ("row inserted", "row deleted", "row moved", "rows inserted", "rows deleted")
+
+
+def _cost(changes):
+    return sum(1 for k, *_ in changes)
+
+
+def _by_row(cells):
+    rows = {}
+    for coord, v in cells.items():
+        col, row = coordinate_from_string(coord)
+        rows.setdefault(row, {})[column_index_from_string(col)] = v
+    return rows
+
+
+_ANCHOR = 500000  # a row far from any edge, so shifted references stay valid
+
+
+def _shape(v, row, cache):
+    """The value as it would read from any row: a formula's relative
+    references are rewritten as if its cell sat on row _ANCHOR, so =B6*C6 in
+    row 6 and =B7*C7 in row 7 have the same shape."""
+    if type(v) is bool:
+        return ("b", v)
+    if isinstance(v, (int, float)):
+        return ("n", f"{v:.15g}")
+    if isinstance(v, Text):
+        return ("t", str(v))
+    if isinstance(v, ArrayF) or (isinstance(v, str) and v.startswith("=") and len(v) > 1):
+        text = v.text if isinstance(v, ArrayF) else v
+        key = (text, row)
+        if key not in cache:
+            try:
+                cache[key] = Translator(text, f"A{row}").translate_formula(f"A{_ANCHOR}")
+            except Exception:
+                cache[key] = text
+        return ("f", cache[key])
+    return ("v", v)
+
+
+def _aligned_diff(orows, nrows, limit=50000):
+    import difflib
+    if len(orows) > limit or len(nrows) > limit:
+        return None
+    cache = {}
+    shape_row = lambda row, r: tuple(sorted((c, _shape(v, r, cache)) for c, v in row.items()))
+    ro, rn = sorted(orows), sorted(nrows)
+    ok = [shape_row(orows[r], r) for r in ro]
+    nk = [shape_row(nrows[r], r) for r in rn]
+    pairs, lone_old, lone_new = [], [], []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ok, nk, autojunk=False).get_opcodes():
+        if tag == "equal" or (tag == "replace" and i2 - i1 == j2 - j1):
+            pairs += zip(range(i1, i2), range(j1, j2))
+            continue
+        # Uneven block: pair rows that still share most of their cells.
+        j = j1
+        for i in range(i1, i2):
+            best = None
+            for jj in range(j, j2):
+                common = len(set(ok[i]) & set(nk[jj]))
+                if common * 2 >= max(len(ok[i]), len(nk[jj]), 1):
+                    best = jj
+                    break
+            if best is None:
+                lone_old.append(i)
+            else:
+                lone_new += range(j, best)
+                pairs.append((i, best))
+                j = best + 1
+        lone_new += range(j, j2)
+    out = []
+    # A deleted row that reappears unchanged elsewhere was moved.
+    moved = []
+    for i in list(lone_old):
+        match = next((j for j in lone_new if nk[j] == ok[i] and ok[i]), None)
+        if match is not None:
+            lone_old.remove(i)
+            lone_new.remove(match)
+            moved.append((i, match))
+    def summary(row, show=6):
+        cols = sorted(row)
+        text = ", ".join(f"{get_column_letter(c)}: {fmt(row[c])}" for c in cols[:show])
+        return text + (f" (+{len(cols) - show} more)" if len(cols) > show else "")
+    events = []  # (new row position, order, change)
+    for i, j in pairs:
+        r_o, r_n = ro[i], rn[j]
+        a, b = orows[r_o], nrows[r_n]
+        for c in sorted(set(a) | set(b)):
+            av, bv = a.get(c), b.get(c)
+            if r_o == r_n:
+                if same(av, bv):
+                    continue
+            elif (av is None) == (bv is None) and (av is None or _shape(av, r_o, cache) == _shape(bv, r_n, cache)):
+                continue
+            kind = "added" if av is None else "removed" if bv is None else "changed"
+            events.append((r_n, c, (kind, f"{get_column_letter(c)}{r_n}", av, bv)))
+    for i in lone_old:
+        # Place a deleted row where it would have been in the new sheet.
+        after = [rn[j] for i2, j in pairs if i2 < i]
+        events.append(((after[-1] if after else 0) + 0.5, 0, ("row deleted", f"row {ro[i]}", summary(orows[ro[i]]), None)))
+    for j in lone_new:
+        events.append((rn[j], 0, ("row inserted", f"row {rn[j]}", None, summary(nrows[rn[j]]))))
+    for i, j in moved:
+        events.append((rn[j], 0, ("row moved", f"row {ro[i]} -> {rn[j]}", summary(orows[ro[i]]), None)))
+    # Empty rows inserted or deleted show up as a jump in the row offset.
+    content_ins = {rn[j] for j in lone_new} | {rn[j] for _, j in moved}
+    content_del = {ro[i] for i in lone_old} | {ro[i] for i, _ in moved}
+    ro0, rn0 = [0] + ro, [0] + rn  # a virtual row 0 lines up the tops
+    anchored = [(0, 0)] + [(i + 1, j + 1) for i, j in pairs]
+    for (i1, j1), (i2, j2) in zip(anchored, anchored[1:]):
+        o1, o2, n1, n2 = ro0[i1], ro0[i2], rn0[j1], rn0[j2]
+        blank = (n2 - n1) - (o2 - o1) - sum(1 for r in content_ins if n1 < r < n2) \
+            + sum(1 for r in content_del if o1 < r < o2)
+        if blank > 0:
+            events.append((n2 - 0.5, 0, ("rows inserted", f"above row {n2}", None, f"{blank} empty row(s)")))
+        elif blank < 0:
+            events.append((n2 - 0.5, 0, ("rows deleted", f"above row {n2}", f"{-blank} empty row(s)", None)))
+    events.sort(key=lambda e: (e[0], e[1]))
+    return [e[2] for e in events]
 
 
 def diff_objects(old, new):
@@ -885,7 +1016,8 @@ def diff(old_path, new_path, markdown=False, title=None):
     changes = [("sheet renamed", a, "", a, b) for a, b in renamed.items()]
     changes += list(diff_cells(read_package_cells(old), as_old(read_package_cells(new))))
     changes += list(diff_objects(describe_objects(old), as_old(describe_objects(new))))
-    changes = [(k, renamed.get(s, s) if k != "sheet renamed" else s, c, o, n, k.startswith(("object", "sheet renamed")))
+    changes = [(k, renamed.get(s, s) if k != "sheet renamed" else s, c, o, n,
+                k.startswith(("object", "sheet renamed")) or k in ROW_EVENTS)
                for k, s, c, o, n in changes]
     show = lambda v, raw: "" if v is None else v if raw else fmt(v)
     if markdown:
@@ -908,6 +1040,8 @@ def diff(old_path, new_path, markdown=False, title=None):
         for kind, sheet, coord, ov, nv, raw in changes:
             if kind == "sheet renamed":
                 print(f"{kind:14} {ov} -> {nv}")
+            elif kind in ROW_EVENTS:
+                print(f"{kind:14} {sheet} {coord}  {nv if nv is not None else ov}")
             elif raw:  # a chart, table, comment...
                 what = f"{ov} -> {nv}" if ov is not None and nv is not None else nv if nv is not None else ov
                 print(f"{kind:14} {sheet}  {what}")
@@ -2164,6 +2298,7 @@ def install(scope="global"):
         raise UserError("this folder isn't inside a git repository. Run it inside one, "
                         "or run `xlgit install` to set up every repository on this computer.")
     for key, value in (("diff.xlsx.textconv", f"{cmd} textconv"), ("diff.xlsx.binary", "true"),
+                       ("diff.xlsx.command", f"{cmd} gitdiff"),
                        ("merge.xlsx.name", "xlgit cell-level merge"),
                        ("merge.xlsx.driver", f"{cmd} merge %O %A %B %P")):
         git("config", *where, key, value)
@@ -2354,6 +2489,19 @@ def main(argv):
             textconv(args[0])
         except Exception as e:
             print(f"(xlgit couldn't read this file: {_reason(e)})")
+        return 0
+    if cmd == "gitdiff":
+        # git diff runs this with: path old-file old-hex old-mode new-file new-hex new-mode
+        if len(args) < 7:
+            print(f"* Unmerged path {args[0] if args else ''}")
+            return 0
+        path, old, new = args[0], args[1], args[4]
+        print(f"=== {path} ===")
+        try:
+            diff(old if old != "/dev/null" else "", new if new != "/dev/null" else "")
+        except Exception as e:
+            print(f"(xlgit couldn't compare this file: {_reason(e)})")
+        sys.stdout.flush()
         return 0
     if cmd == "merge":
         if len(args) < 3:

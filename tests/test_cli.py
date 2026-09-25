@@ -96,7 +96,10 @@ def test_diff_without_arguments_shows_changes_since_last_commit(env, tmp_path):
     one = run(env, repo, "diff", "budget.xlsx").stdout
     assert "1000 -> 1100" in one and "new.xlsx" not in one
     # and plain git diff shows cells too, once set up
-    assert "+Data!B1\t1100" in git(env, repo, "diff")
+    assert "changed        Data!B1  1000 -> 1100" in git(env, repo, "diff")
+    # git log -p goes through the text form
+    git(env, repo, "commit", "-qam", "raise rent")
+    assert "+Data!B1\t1100" in git(env, repo, "log", "-p", "-1")
 
 
 def test_friendly_errors(env, tmp_path):
