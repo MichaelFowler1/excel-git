@@ -114,6 +114,8 @@ def raw_value(c, sst, ref=None, shared=None):
     t = c.get("t")
     v = c.find(m("v"))
     if t == "inlineStr":
+        if c.find(m("is")) is None:
+            return None  # <c t="inlineStr"/> with no text is an empty cell
         return ("s", "".join(x.text or "" for x in c.iter(m("t")) if _not_phonetic(x)))
     if v is None or v.text is None:
         return None
@@ -929,6 +931,14 @@ def signature(r):
     return r["reason"]
 
 
+def pool_context():
+    """Workers are replaced every 50 files to cap memory. Forking a
+    replacement from the pool's helper thread can copy a held queue lock
+    into it and hang the run, so start workers from a clean server process."""
+    methods = multiprocessing.get_all_start_methods()
+    return multiprocessing.get_context("forkserver" if "forkserver" in methods else "spawn")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("corpus")
@@ -953,9 +963,10 @@ def main(argv=None):
     files = files[:a.limit]
     jobs = [(str(f), a.seed + i, a.keep, a.writer) for f in files for i in range(a.rounds)]
     stats, sigs = collections.Counter(), collections.defaultdict(list)
-    with open(a.out, "w") as out, multiprocessing.Pool(a.jobs, maxtasksperchild=50) as pool:
+    with open(a.out, "w") as out, pool_context().Pool(a.jobs, maxtasksperchild=50) as pool:
         for i, r in enumerate(pool.imap_unordered(_job, jobs, chunksize=4), 1):
             out.write(json.dumps(r) + "\n")
+            out.flush()
             stats[r["status"]] += 1
             if r["status"] == "fail":
                 sigs[signature(r)].append(r)
