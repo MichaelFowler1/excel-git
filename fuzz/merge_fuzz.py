@@ -146,6 +146,7 @@ class Editor:
         self.data = data
         self.trees = {}
         self.rows = {}  # part -> {row number: row element}
+        self.removed = set()
         self.sst_part = self.pkg.target(self.pkg.workbook, "sharedStrings")
         self.sst = shared_strings(self.pkg)
         self.sst_root = self.pkg.xml(self.sst_part) if self.sst_part in self.pkg.parts else None
@@ -239,6 +240,92 @@ class Editor:
                 for a in ("t", "si", "ref"):
                     f.attrib.pop(a, None)
 
+    # --- whole sheets, the way Excel does them ---
+
+    def rename_sheet(self, old, new):
+        wb = self.tree(self.pkg.workbook)
+        for sh in wb.find(m("sheets")):
+            if sh.get("name") == old:
+                sh.set("name", new)
+        quoted = lambda n: "'" + n.replace("'", "''") + "'"
+        for d in wb.iter(m("definedName")):
+            if d.text:
+                d.text = d.text.replace(quoted(old) + "!", quoted(new) + "!")
+                d.text = re.sub(rf"(?<![\w'.]){re.escape(old)}!", quoted(new) + "!", d.text)
+
+    def add_sheet(self, name, cells):
+        wbpart = self.pkg.workbook
+        n = 1
+        while f"xl/worksheets/sheet{n}.xml" in self.pkg.parts or f"xl/worksheets/sheet{n}.xml" in self.trees:
+            n += 1
+        part = f"xl/worksheets/sheet{n}.xml"
+        root = etree.Element(m("worksheet"), nsmap={None: MAIN, "r": xlgit.REL})
+        etree.SubElement(root, m("sheetData"))
+        self.trees[part] = root
+        for coord, v in sorted(cells.items(), key=lambda kv: col_row(kv[0])[::-1]):
+            self.set(part, coord, v, rng=random.Random(0))
+        rels = self.rels_tree(wbpart)
+        ids = {r.get("Id") for r in rels}
+        k = 1
+        while f"rId{k}" in ids:
+            k += 1
+        r = etree.SubElement(rels, f"{{{xlgit.PKG_REL}}}Relationship")
+        r.set("Id", f"rId{k}")
+        r.set("Type", xlgit.WORKSHEET_REL)
+        r.set("Target", xlgit.relative(part, wbpart))
+        wb = self.tree(wbpart)
+        sheets = wb.find(m("sheets"))
+        sid = max([int(sh.get("sheetId") or 0) for sh in sheets] + [0]) + 1
+        sh = etree.SubElement(sheets, m("sheet"))
+        sh.set("name", name)
+        sh.set("sheetId", str(sid))
+        sh.set(xlgit.RID, f"rId{k}")
+        ct = self.tree("[Content_Types].xml")
+        o = etree.SubElement(ct, f"{{{CT_NS}}}Override")
+        o.set("PartName", "/" + part)
+        o.set("ContentType", xlgit.WORKSHEET_CT)
+
+    def delete_sheet(self, name):
+        wbpart = self.pkg.workbook
+        wb = self.tree(wbpart)
+        sheets = wb.find(m("sheets"))
+        els = list(sheets)
+        el = next(sh for sh in els if sh.get("name") == name)
+        idx = els.index(el)
+        rid = el.get(xlgit.RID)
+        sheets.remove(el)
+        rels = self.rels_tree(wbpart)
+        part = None
+        for r in list(rels):
+            if r.get("Id") == rid:
+                part = xlgit.resolve(wbpart, r.get("Target"))
+                rels.remove(r)
+        dn = wb.find(m("definedNames"))
+        for d in list(dn if dn is not None else []):
+            lid = d.get("localSheetId")
+            if lid is not None and int(lid) == idx:
+                dn.remove(d)
+            elif lid is not None and int(lid) > idx:
+                d.set("localSheetId", str(int(lid) - 1))
+            elif d.text and re.search(rf"(^|[^\w.]){re.escape(name)}!|'{re.escape(name)}'!", d.text):
+                d.text = "#REF!"
+        for view in wb.iter(m("workbookView")):
+            for a in ("activeTab", "firstSheet"):
+                if view.get(a) and int(view.get(a)) >= len(sheets):
+                    view.set(a, "0")
+        if part:
+            self.removed |= {part, xlgit.rels_name(part)}
+            ct = self.tree("[Content_Types].xml")
+            for o in list(ct):
+                if (o.get("PartName") or "").lstrip("/") == part:
+                    ct.remove(o)
+
+    def rels_tree(self, owner):
+        name = xlgit.rels_name(owner)
+        if name not in self.trees:
+            self.trees[name] = etree.fromstring(self.pkg.parts[name])
+        return self.trees[name]
+
     def save(self):
         trees = dict(self.trees)
         if self.sst_root is not None and self.sst_root.find(m("si")) is not None:
@@ -247,12 +334,19 @@ class Editor:
             trees[self.sst_part] = self.sst_root
         out = io.BytesIO()
         with zipfile.ZipFile(io.BytesIO(self.data)) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+            written = set()
             for info in zin.infolist():
+                if info.filename in self.removed:
+                    continue
                 if info.filename in trees:
                     z.writestr(info.filename, etree.tostring(trees[info.filename], xml_declaration=True,
                                                              encoding="UTF-8", standalone=True))
                 else:
                     z.writestr(info, zin.read(info))
+                written.add(info.filename)
+            for name, root in trees.items():
+                if name not in written and name not in self.removed:
+                    z.writestr(name, etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True))
         return out.getvalue()
 
 
@@ -551,8 +645,16 @@ def run_one(path, seed, keep=None, writer=None):
                 expect[(name, coord)] = (tv, False, tstyle)
             else:
                 expect[(name, coord)] = (ov, True, None)
+    ops = sheet_ops(pkg, edits, rng) if writer is None else {}
+    if "rename" in ops:
+        theirs.rename_sheet(*ops["rename"])
+    if "add" in ops:
+        theirs.add_sheet(*ops["add"])
+    if "delete" in ops:
+        theirs.delete_sheet(ops["delete"])
     obytes, tbytes = ours.save(), theirs.save()
     res["edits"] = len(expect)
+    res["ops"] = sorted(ops)
     if writer == "libreoffice":
         try:
             obytes = libreoffice_resave(obytes)
@@ -582,7 +684,7 @@ def run_one(path, seed, keep=None, writer=None):
             if writer:
                 verify_three_way(data, obytes, tbytes, merged, mg, base_problems)
             else:
-                verify(pkg, data, obytes, merged, mg, expect, base_problems, o, openpyxl_ok)
+                verify(pkg, data, obytes, tbytes, merged, mg, expect, base_problems, o, openpyxl_ok, ops)
             # The diff path should cope with anything the merge handles.
             try:
                 with open(os.devnull, "w") as dn:
@@ -613,7 +715,7 @@ def run_one(path, seed, keep=None, writer=None):
     return res
 
 
-def verify(pkg, data, obytes, merged, mg, expect, base_problems, merged_path, openpyxl_ok):
+def verify(pkg, data, obytes, tbytes, merged, mg, expect, base_problems, merged_path, openpyxl_ok, ops):
     worse = new_problems(base_problems, structural(merged, "merged"))
     if worse:
         raise Check(f"merged: {worse[0].split(':', 1)[0]}", "; ".join(worse)[:300])
@@ -630,8 +732,21 @@ def verify(pkg, data, obytes, merged, mg, expect, base_problems, merged_path, op
     mvals = sheet_values(mpkg)
     ovals = sheet_values(xlgit.Package(obytes))
     conflicts = {(s, c) for s, c, *_ in mg.conflicts}
+    renamed = dict([ops["rename"]]) if "rename" in ops else {}
+    to_merged = lambda sheet: renamed.get(sheet, sheet)
+    if "delete" in ops and ops["delete"] in mvals:
+        raise Check("deleted sheet came back", ops["delete"])
+    if "add" in ops:
+        name = ops["add"][0]
+        if name not in mvals:
+            raise Check("added sheet lost", name)
+        if mvals[name] != sheet_values(xlgit.Package(tbytes))[name]:
+            raise Check("added sheet changed", name)
+    for old, new in renamed.items():
+        if new not in mvals:
+            raise Check("sheet rename lost", f"{old} -> {new}")
     for (sheet, coord), (want, conflict, tstyle) in expect.items():
-        got = mvals.get(sheet, {}).get(coord)
+        got = mvals.get(to_merged(sheet), {}).get(coord)
         if conflict:
             if (sheet, coord) not in conflicts:
                 raise Check("conflict not reported", f"{sheet}!{coord}")
@@ -643,7 +758,7 @@ def verify(pkg, data, obytes, merged, mg, expect, base_problems, merged_path, op
                 kind = "number changed"
             raise Check(kind, f"{sheet}!{coord} want={want!r} got={got!r}")
         if tstyle is not None and mg.same_styles:
-            part = dict((n, p) for n, _, p in mpkg.sheets())[sheet]
+            part = dict((n, p) for n, _, p in mpkg.sheets())[to_merged(sheet)]
             if styles(mpkg, part).get(coord) != tstyle:
                 raise Check("their cell style not carried over", f"{sheet}!{coord}")
     extra = conflicts - set(expect) - {(s, c) for s, c in conflicts if s == "(file)" or c == "(sheet)"}
@@ -656,8 +771,11 @@ def verify(pkg, data, obytes, merged, mg, expect, base_problems, merged_path, op
         op = os.path.join(td, "o.xlsx")
         Path(op).write_bytes(obytes)
         ours_cells = xlgit.read_cells(op)
+    gone = ops.get("delete")
     for sheet, cells in ours_cells.items():
-        mc = merged_cells.get(sheet)
+        if sheet == gone:
+            continue
+        mc = merged_cells.get(to_merged(sheet))
         if mc is None:
             raise Check("sheet lost", sheet)
         for coord in set(cells) | set(mc):
@@ -665,19 +783,48 @@ def verify(pkg, data, obytes, merged, mg, expect, base_problems, merged_path, op
                 continue
             if not _eq(cells.get(coord), mc.get(coord)):
                 raise Check("untouched cell changed", f"{sheet}!{coord} {cells.get(coord)!r} -> {mc.get(coord)!r}")
-    if set(merged_cells) - set(ours_cells) - {xlgit.CONFLICT_SHEET}:
-        raise Check("sheet appeared", repr(set(merged_cells) - set(ours_cells)))
+    appeared = set(merged_cells) - {to_merged(n) for n in ours_cells} - {xlgit.CONFLICT_SHEET}
+    if appeared - {ops.get("add", ("",))[0]}:
+        raise Check("sheet appeared", repr(appeared))
     # Objects: nothing lost.
     oobj = xlgit.describe_objects(xlgit.Package(obytes))
     mobj = xlgit.describe_objects(mpkg)
     for sheet, items in oobj.items():
-        missing = collections.Counter(items) - collections.Counter(mobj.get(sheet, []))
+        if sheet == gone:
+            continue
+        missing = collections.Counter(items) - collections.Counter(mobj.get(to_merged(sheet), []))
         if missing:
             raise Check("object lost or changed", f"{sheet}: {list(missing)[:2]}")
-    lost = [p for p in xlgit.reachable(xlgit.Package(obytes).parts) - set(mpkg.parts)
-            if not re.search(r"calcChain", p)]
+    opkg = xlgit.Package(obytes)
+    # The deleted sheet's part, and everything only it used, may go.
+    dropped = {p for n, _, p in opkg.sheets() if n == gone}
+    lost = [p for p in xlgit.reachable(opkg.parts) - set(mpkg.parts)
+            if not re.search(r"calcChain", p) and not (gone and _only_used_by(opkg, p, dropped))]
     if lost:
         raise Check("part lost", repr(sorted(lost)[:3]))
+
+
+def sheet_ops(pkg, edits, rng):
+    """Whole-sheet changes on their branch: rename a sheet, add one, delete
+    one nobody edited."""
+    names = [n for n, _, p in pkg.sheets()]
+    if any(n.lower() == xlgit.CONFLICT_SHEET for n in names):
+        return {}
+    edited = {name for name, _ in edits.values()}
+    ops = {}
+    if rng.random() < 0.3:
+        old = rng.choice(names)
+        new = ("Renamed " + old)[:31]
+        if new.lower() not in {n.lower() for n in names}:
+            ops["rename"] = (old, new)
+    if rng.random() < 0.3:
+        new = "Added by them"
+        if new.lower() not in {n.lower() for n in names}:
+            ops["add"] = (new, {"A1": ("s", "note"), "B2": ("n", 42), "C3": ("f", "B2*2")})
+    candidates = [n for n, _, p in pkg.sheets() if n not in edited and n != ops.get("rename", ("",))[0] and p]
+    if rng.random() < 0.4 and len(names) > 1 and candidates:
+        ops["delete"] = rng.choice(candidates)
+    return ops
 
 
 def libreoffice_resave(data):
@@ -727,6 +874,18 @@ def verify_three_way(data, obytes, tbytes, merged, mg, known_problems):
         missing = collections.Counter(items) - collections.Counter(mobj.get(sheet, []))
         if missing:
             raise Check("object lost or changed", f"{sheet}: {list(missing)[:2]}")
+
+
+def _only_used_by(pkg, part, sheets):
+    """Is part reachable only through the given sheet parts?"""
+    seen, stack = set(), [""]
+    while stack:
+        owner = stack.pop()
+        for _, _, t, ext in pkg.rels(owner):
+            if not ext and t in pkg.parts and t not in seen and t not in sheets:
+                seen.add(t)
+                stack.append(t)
+    return part not in seen
 
 
 def _eq(a, b):
