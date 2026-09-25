@@ -222,6 +222,64 @@ class Package:
     def xml(self, name):
         return parse_xml(self.parts[name]) if name in self.parts else None
 
+    def scan_sheet(self, part, sst=None, dates=frozenset(), styles_for=None):
+        """Stream through a worksheet part without keeping it in memory.
+        Returns (cells, children, styles): cell values (if sst is given), the
+        worksheet's top-level elements other than sheetData, and the style of
+        each cell in styles_for. Sheets can hold millions of empty formatted
+        cells; a parsed copy of one can take gigabytes."""
+        cells, children, styles, shared = {}, [], {}, {}
+        root_tag = None
+        ROW, C, SD = m("row"), m("c"), m("sheetData")
+        rnum = 0
+        depth = 0
+        for event, el in etree.iterparse(io.BytesIO(self.parts[part]), events=("start", "end"),
+                                         resolve_entities=False, no_network=True):
+            if event == "start":
+                depth += 1
+                if depth == 1:
+                    root_tag = local(el)
+                    if root_tag not in SHEET_ROOTS:
+                        break
+                continue
+            depth -= 1
+            if el.tag == ROW and depth == 2:
+                r = el.get("r")
+                rnum = int(r) if r else rnum + 1
+                prev = None
+                for c in el.iterchildren(C):
+                    coord = c.get("r")
+                    if coord is None:
+                        if isinstance(prev, str):
+                            prev = column_index_from_string(coordinate_from_string(prev)[0])
+                        prev = (prev or 0) + 1
+                        coord = f"{get_column_letter(prev)}{rnum}"
+                    else:
+                        prev = coord
+                    if sst is not None:
+                        v = _cell_value(c, coord, sst, shared, dates)
+                        if v is not None:
+                            cells[coord] = v
+                    if styles_for is not None and coord in styles_for:
+                        styles[coord] = c.get("s")
+                el.clear()
+                while el.getprevious() is not None:
+                    del el.getparent()[0]
+            elif depth == 1:
+                if el.tag == SD:
+                    el.clear()
+                else:
+                    children.append(el)
+        return cells, children, styles
+
+    def sheet_children(self, part):
+        """The worksheet's top-level elements except its cells (drawing,
+        legacyDrawing, tableParts...), cached."""
+        key = ("children", part)
+        if key not in self._ro:
+            self._ro[key] = self.scan_sheet(part)[1] if part in self.parts else []
+        return self._ro[key]
+
     def ro(self, name):
         """Parsed part, cached: for reading only, never modify it."""
         if name not in self._ro:
@@ -276,7 +334,7 @@ class Package:
         rels = {rid: (typ, t) for rid, typ, t, ext in self.rels(part) if not ext}
         if key == "comments":
             return next(((t, typ) for typ, t in rels.values() if kind_of(typ) == "comments"), (None, None))
-        el = self.ro(part).find(m(key))
+        el = next((c for c in self.sheet_children(part) if local(c) == key), None)
         if el is None:
             return None, None
         typ, t = rels.get(el.get(RID), (None, None))
@@ -395,8 +453,8 @@ class Keys:
                 if kind == "drawing":
                     key = ("drawing", sk)
                 elif kind == "vmlDrawing":
-                    root = self._tree(owner)
-                    el = next((e for e in root.iter() if e.get(RID) == rid), None) if root is not None else None
+                    el = next((e for top in self.pkg.sheet_children(owner) for e in top.iter()
+                               if e.get(RID) == rid), None)
                     key = ("vml", sk, local(el) if el is not None else rid)
                 elif kind == "comments":
                     key = ("comments", sk)
@@ -526,15 +584,11 @@ def sheet_cells(pkg, part, sst, dates=frozenset()):
     """{coord: value} for one worksheet part, read straight from its XML.
     Formulas are '=...' strings (shared formulas spelled out per cell), text
     that looks like a formula or error is Text, errors are '#...' strings."""
-    root = pkg.ro(part)
-    if root is None or local(root) not in SHEET_ROOTS:
+    if part not in pkg.parts:
         return {}
-    out, shared = {}, {}
-    for coord, c in iter_sheet_cells(root):
-        v = _cell_value(c, coord, sst, shared, dates)
-        if v is not None:
-            out[coord] = v
-    return out
+    cells, children, _ = pkg.scan_sheet(part, sst, dates)
+    pkg._ro[("children", part)] = children
+    return cells
 
 
 def _cell_value(c, coord, sst, shared, dates):
@@ -604,7 +658,13 @@ def read_package_cells(pkg):
     sst = [_text(si) for si in pkg.shared_strings()]
     dates = _date_styles(pkg)
     return {name: sheet_cells(pkg, part, sst, dates)
-            for name, _, part in pkg.sheets() if part in pkg.parts and local(pkg.ro(part)) in SHEET_ROOTS}
+            for name, _, part in pkg.sheets() if part in pkg.parts and _root_name(pkg.parts[part]) in SHEET_ROOTS}
+
+
+def _root_name(data):
+    """Local name of an XML document's root element, without parsing it all."""
+    for _, el in etree.iterparse(io.BytesIO(data), events=("start",), resolve_entities=False, no_network=True):
+        return local(el)
 
 
 def read_cells(path):
@@ -1182,10 +1242,10 @@ class Merger:
         their_styles, base_styles = {}, None
         if self.same_styles:
             tpart = dict((n, p) for n, _, p in self.t.sheets())[tname]
-            their_styles = {ref: c.get("s") for ref, c in iter_sheet_cells(self.t.ro(tpart))}
+            their_styles = self.t.scan_sheet(tpart, styles_for=set(edits))[2]
             bpart = dict((n, p) for n, _, p in self.b.sheets()).get(self.lineage_o.get(oname))
             if bpart and self.b.styles_bytes() == self.o.styles_bytes():
-                base_styles = {ref: c.get("s") for ref, c in iter_sheet_cells(self.b.ro(bpart))}
+                base_styles = self.b.scan_sheet(bpart, styles_for=set(edits))[2]
         rows = {}
         last = 0
         for row in sd.findall(m("row")):

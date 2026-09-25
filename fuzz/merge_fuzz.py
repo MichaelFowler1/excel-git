@@ -931,6 +931,17 @@ def signature(r):
     return r["reason"]
 
 
+def _cap_memory(gigabytes):
+    """A file that blows up memory should fail its own run with MemoryError,
+    not get a worker killed by the system (the pool would wait for it forever)."""
+    try:
+        import resource
+        limit = int(gigabytes * 1024 ** 3)
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
 def pool_context():
     """Workers are replaced every 50 files to cap memory. Forking a
     replacement from the pool's helper thread can copy a held queue lock
@@ -951,6 +962,7 @@ def main(argv=None):
     ap.add_argument("--keep", help="copy base/ours/theirs/merged of failures here")
     ap.add_argument("--writer", choices=["libreoffice"],
                     help="re-save ours in another app before merging (needs soffice)")
+    ap.add_argument("--max-memory", type=float, default=4.0, help="GB per worker (default 4)")
     ap.add_argument("--only", help="rerun only files listed (one per line) in this file")
     a = ap.parse_args(argv)
     files = sorted(p for p in Path(a.corpus).rglob("*") if p.suffix.lower() in (".xlsx", ".xlsm")
@@ -963,7 +975,7 @@ def main(argv=None):
     files = files[:a.limit]
     jobs = [(str(f), a.seed + i, a.keep, a.writer) for f in files for i in range(a.rounds)]
     stats, sigs = collections.Counter(), collections.defaultdict(list)
-    with open(a.out, "w") as out, pool_context().Pool(a.jobs, maxtasksperchild=50) as pool:
+    with open(a.out, "w") as out, pool_context().Pool(a.jobs, _cap_memory, (a.max_memory,), maxtasksperchild=50) as pool:
         for i, r in enumerate(pool.imap_unordered(_job, jobs, chunksize=4), 1):
             out.write(json.dumps(r) + "\n")
             out.flush()
