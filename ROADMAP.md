@@ -14,7 +14,7 @@ Done for the first round: `fuzz/merge_fuzz.py` gives each workbook random edits 
 
 ### 2. Understand inserted, deleted and moved rows
 
-Diffs now report inserted, deleted and moved rows as rows (on real Enron revisions, a 6,849-line diff became 18 lines). Still to do: merges that follow rows too, so a row one branch inserted doesn't conflict with the other branch's edits below it; inserted columns; and matching table rows by an ID column, so two people can add rows to the same table without a conflict, the way a database handles it.
+Diffs report inserted, deleted and moved rows as rows (on real Enron revisions, a 6,849-line diff became 18 lines), and merges follow them when one branch changed a sheet's rows. Still to do: both branches inserting rows on the same sheet, inserted columns, recognising more row changes on small sheets, and matching table rows by an ID column, so two people can add rows to the same table without a conflict, the way a database handles it.
 
 ## Stage 2: code review for spreadsheets
 

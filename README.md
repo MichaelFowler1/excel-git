@@ -11,6 +11,7 @@ Git and GitHub treat `.xlsx` as an opaque binary blob. You can commit, fork and 
 | `git diff` | `Binary files differ` | `changed Budget!B2 1000 -> 1100`, plus inserted, deleted and moved rows, and chart, image and comment changes |
 | Seeing changes | n/a | `xlgit diff --html`: the sheet as a grid in your browser, changes highlighted |
 | Merge, different cells edited | conflict, pick one whole file | merges cleanly |
+| Merge, one side inserted rows | conflict | the other side's edits follow their rows |
 | Merge, same cell edited | conflict | conflict on just that cell, listed in a `_merge_conflicts` sheet with a link to it |
 | Charts, images, comments, formatting, macros | n/a | kept, and their edits to them carried over |
 | Tables and pivot tables | n/a | merged: you add rows, they add a column, you get both |
@@ -70,6 +71,7 @@ Open the workbook, go through the `_merge_conflicts` sheet (each row links to it
 A workbook is a zip of XML files: one per sheet, one per chart, one per image and so on. Instead of re-saving the whole thing through a spreadsheet library (which is how charts used to get lost), xlgit starts from your copy's zip and only rewrites the XML that has to change:
 
 - **Cells**: 3-way merge cell by cell. A cell only one side changed takes that side's value.
+- **Rows**: if one branch inserted, deleted or moved rows and the other edited cells, the edits land on the rows where their cells ended up, with formula references renumbered the way Excel does it. An edit to a row the other branch deleted is a conflict.
 - **Charts, images, comments, macros**: 3-way merge object by object. If only their branch changed a chart, you get their version. If both did, yours is kept and it's flagged as a conflict. Chart edits caused by cell changes (Excel caches plotted values inside the chart) don't count as edits.
 - **Tables**: merged field by field. Their new column plus your new rows gives a table with both. Tables added on their branch come over, and if both branches added a `Table2`, theirs is renamed `Table3` and their formulas are updated to match.
 - **Pivot tables**: a pivot, its data cache and the cached records merge as one bundle. A branch that only refreshed a pivot (same layout, new data) doesn't count as an edit, so your data change and their "switch to Average" merge cleanly. New pivots from their branch come over, sharing an existing cache when they used one.
@@ -152,7 +154,9 @@ python fuzz/merge_fuzz.py corpus --keep failed/
 - Until Excel refreshes a merged pivot, the numbers in its cells are the old ones. Excel does this on open, but tools that read the file without Excel (pandas, openpyxl) see the stale values.
 - Slicers, timelines and tables linked to external data connections aren't merged. They're reported as conflicts so nothing disappears silently.
 - If both branches added a chart to a sheet that had none, only yours is kept (flagged).
-- Diffs recognise inserted, deleted and moved rows, but merges don't yet: if both branches changed a sheet and one of them inserted rows, you can get conflicts on cells that only moved. That's next on the [roadmap](ROADMAP.md). Inserted columns show as changed cells for now.
+- Inserted and deleted rows are followed when only one branch changed a sheet's rows. If both branches inserted or deleted rows on the same sheet, that sheet merges cell by cell, and cells that only moved can show up as conflicts.
+- Rows are recognised by their contents. A row change can't always be recognised (say, deleting one of many identical rows); then the sheet merges cell by cell and anything unclear is reported as a conflict, never guessed.
+- Inserted columns show as changed cells for now.
 - `.xls` (the old pre-2007 format) isn't supported. Save as `.xlsx`.
 
 ## Roadmap

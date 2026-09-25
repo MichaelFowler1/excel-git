@@ -1648,7 +1648,7 @@ class Merger:
             self.oc, self.tc = self.tc, self.oc
             omaps, tmaps, bo, bt = tmaps, {}, bt, bo
             self.notes.append("their branch inserted or deleted rows on " + ", ".join(map(repr, omaps))
-                              + "; your edits were moved to match")
+                              + "; your edits moved to the rows where those cells are now")
         for bname in tmaps:
             self.notes.append(f"their branch inserted or deleted rows on {bname!r} and yours did on other "
                               f"sheets; {bname!r} merged cell by cell")
@@ -2581,13 +2581,15 @@ def merge(base_path, ours_path, theirs_path, display_path=None):
         f.write(data)
     took = f"{mg.cells_taken} cell(s)" + (f" and {len(mg.objects_taken)} object(s)" if mg.objects_taken else "")
     if mg.swapped:  # built on their version; the cells written were yours
-        took = "their inserted/deleted rows plus " + took.replace("cell(s)", "of your cell edit(s)", 1)
+        took = took.replace("cell(s)", "of your edited cell(s)", 1) + " onto their inserted/deleted rows"
     if not mg.conflicts:
-        say(f"xlgit merged {name}: took {took}" + ("" if mg.swapped else " from the other branch") + ", no conflicts.")
+        say(f"xlgit merged {name}: " + (f"moved {took}" if mg.swapped else f"took {took} from the other branch")
+            + ", no conflicts.")
     for note in mg.notes:
         say(f"  note: {note}")
     if mg.conflicts:
-        say(f"xlgit merged {name}: took {took}" + ("" if mg.swapped else " from the other branch") + ", but "
+        say(f"xlgit merged {name}: " + (f"moved {took}" if mg.swapped else f"took {took} from the other branch")
+            + ", but "
             f"{len(mg.conflicts)} change(s) clash.")
         for sheet, coord, bv, ov, tv in mg.conflicts[:20]:
             say(f"  {sheet} {coord}: yours {fmt(ov)}, theirs {fmt(tv)} (was {fmt(bv)})")
@@ -2685,9 +2687,12 @@ def _remove_lines(path, lines):
 
 
 def install(scope="global"):
-    here = os.path.abspath(__file__).replace("\\", "/")
-    py = sys.executable.replace("\\", "/")
-    cmd = f'"{py}" "{here}"'
+    if getattr(sys, "frozen", False):  # the standalone download: git runs the program itself
+        cmd = '"' + sys.executable.replace("\\", "/") + '"'
+    else:
+        here = os.path.abspath(__file__).replace("\\", "/")
+        py = sys.executable.replace("\\", "/")
+        cmd = f'"{py}" "{here}"'
     where = ["--global"] if scope == "global" else []
     root = repo_root()
     if scope == "repo" and not root:
