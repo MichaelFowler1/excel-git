@@ -43,6 +43,7 @@ from pathlib import Path
 
 from lxml import etree
 from openpyxl import load_workbook
+from openpyxl.formula.translate import Translator
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string, get_column_letter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -96,12 +97,19 @@ def _not_phonetic(t):
     return p is None or etree.QName(p).localname != "rPh"
 
 
-def raw_value(c, sst):
+def raw_value(c, sst, ref=None, shared=None):
     """A cell's value exactly as stored: ('f', text) | ('s', text) | ('n', float)
-    | ('b', bool) | ('e', text) | ('arr',) | None."""
+    | ('b', bool) | ('e', text) | None. A cell sharing a formula gets it
+    translated from the cell that holds it (pass ref and a dict for shared)."""
     f = c.find(m("f"))
     if f is not None:
-        if f.get("t") in ("shared", "array") and not (f.text or "").strip():
+        if f.get("t") == "shared" and shared is not None:
+            if (f.text or "").strip():
+                shared[f.get("si")] = (ref, f.text)
+            elif f.get("si") in shared:
+                origin, text = shared[f.get("si")]
+                return ("f", Translator("=" + text, origin).translate_formula(ref)[1:])
+        if not (f.text or "").strip():
             return ("sharedref",)
         return ("f", f.text or "")
     t = c.get("t")
@@ -168,6 +176,9 @@ class Editor:
             c.set("r", coord)
             later = next((x for ref, x in iter_cells(row, rnum) if col_row(ref)[0] > col), None)
             later.addprevious(c) if later is not None else row.append(c)
+        f = c.find(m("f"))
+        if f is not None and f.get("t") == "shared" and (f.text or "").strip():
+            self.unshare(sd, f.get("si"))
         for child in list(c):
             if etree.QName(child).localname in ("f", "v", "is"):
                 c.remove(child)
@@ -208,6 +219,23 @@ class Editor:
         for i, el in enumerate(new):
             c.insert(i, el)
 
+    @staticmethod
+    def unshare(sd, si):
+        """Editing the cell that holds a shared formula: spell the formula out
+        in every cell that shared it, as Excel does."""
+        master = None
+        for rnum, row in iter_rows(sd):
+            for ref, c in iter_cells(row, rnum):
+                f = c.find(m("f"))
+                if f is None or f.get("t") != "shared" or f.get("si") != si:
+                    continue
+                if master is None and (f.text or "").strip():
+                    master = (ref, f.text)
+                elif master is not None:
+                    f.text = Translator("=" + master[1], master[0]).translate_formula(ref)[1:]
+                for a in ("t", "si", "ref"):
+                    f.attrib.pop(a, None)
+
     def save(self):
         trees = dict(self.trees)
         if self.sst_root is not None and self.sst_root.find(m("si")) is not None:
@@ -247,7 +275,7 @@ def protected_areas(pkg, part):
                     refs.append(ref)
     root = pkg.xml(part)
     for f in root.iter(m("f")):
-        if f.get("ref") and f.get("t") in ("shared", "array"):
+        if f.get("ref") and f.get("t") == "array":
             refs.append(f.get("ref"))
     for mc in root.iter(m("mergeCell")):
         refs.append(mc.get("ref"))
@@ -269,7 +297,7 @@ def plan(pkg, rng):
                 existing[ref] = c
         prot = protected_areas(pkg, part)
         ok = lambda ref: not any(xlgit.overlaps(ref, p) for p in prot)
-        editable = [ref for ref, c in existing.items() if ok(ref) and raw_value(c, sst) not in (("sharedref",),)]
+        editable = [ref for ref, c in existing.items() if ok(ref)]
         maxc = max([col_row(r)[0] for r in existing] or [1])
         maxr = max([col_row(r)[1] for r in existing] or [1])
         fresh = set()
@@ -447,10 +475,10 @@ def sheet_values(pkg):
         if part not in pkg.parts:
             continue
         sd = pkg.xml(part).find(m("sheetData"))
-        vals = {}
+        vals, shared = {}, {}
         for rnum, row in (iter_rows(sd) if sd is not None else []):
             for ref, c in iter_cells(row, rnum):
-                v = raw_value(c, sst)
+                v = raw_value(c, sst, ref, shared)
                 if v is not None:
                     vals[ref] = v
         out[name] = vals
@@ -482,11 +510,17 @@ def run_one(path, seed, keep=None):
     except Exception as e:
         res.update(status="fail", reason="xlgit cannot read input", detail=_where(e))
         return res
+    # Cross-check with openpyxl (what pandas uses), unless it can't read the
+    # input either or is very slow on it.
+    signal.signal(signal.SIGALRM, _timeout)
+    signal.alarm(10)
     try:
         load_workbook(io.BytesIO(data))
         openpyxl_ok = True
-    except Exception:
+    except (Exception, Timeout):
         openpyxl_ok = False
+    finally:
+        signal.alarm(0)
 
     edits = plan(pkg, rng)
     if not edits:

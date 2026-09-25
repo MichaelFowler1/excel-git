@@ -86,6 +86,16 @@ ArrayF = namedtuple("ArrayF", "ref text")
 Opaque = namedtuple("Opaque", "desc")
 
 
+# Workbooks come from anyone who can open a pull request: never resolve
+# entities (external ones read local files; older lxml resolved them by
+# default) or touch the network.
+_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
+
+
+def parse_xml(data):
+    return etree.fromstring(data, _PARSER)
+
+
 def m(tag):
     return f"{{{MAIN}}}{tag}"
 
@@ -180,7 +190,7 @@ def reachable(parts):
         rn = rels_name(owner)
         if rn not in parts:
             continue
-        for r in etree.fromstring(parts[rn]):
+        for r in parse_xml(parts[rn]):
             if r.get("TargetMode") == "External":
                 continue
             t = resolve(owner, r.get("Target"))
@@ -213,7 +223,7 @@ class Package:
             return cls(f.read())
 
     def xml(self, name):
-        return etree.fromstring(self.parts[name]) if name in self.parts else None
+        return parse_xml(self.parts[name]) if name in self.parts else None
 
     def ro(self, name):
         """Parsed part, cached: for reading only, never modify it."""
@@ -342,7 +352,7 @@ class Keys:
     def _tree(self, part):
         if part not in self._xml:
             try:
-                self._xml[part] = etree.fromstring(self.pkg.parts[part])
+                self._xml[part] = parse_xml(self.pkg.parts[part])
             except etree.XMLSyntaxError:
                 self._xml[part] = None
         return self._xml[part]
@@ -664,7 +674,7 @@ def normalized(keys, part, derived=False):
     relset = tuple(sorted((kind_of(typ), target_key(t, ext)) for typ, t, ext in rels.values()
                           if not (derived and kind_of(typ) == "pivotCacheRecords")))
     try:
-        root = etree.fromstring(pkg.parts[part])
+        root = parse_xml(pkg.parts[part])
     except etree.XMLSyntaxError:
         return pkg.parts[part], relset
     kind = keys.key_of.get(part, ("",))[0]
@@ -873,7 +883,7 @@ class Merger:
     def tree(self, name, create=None):
         if name not in self.trees:
             if name in self.res:
-                self.trees[name] = etree.fromstring(self.res[name])
+                self.trees[name] = parse_xml(self.res[name])
             elif create is not None:
                 self.trees[name] = create
                 self.put(name, b"")

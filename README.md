@@ -66,6 +66,18 @@ python -m pytest tests
 
 The tests build workbook versions with charts, comments and named ranges, run real `git merge` through the driver, and check every object survived. Set `XLGIT_KEEP=some/dir` to keep the merged files and open them in Excel yourself.
 
+### Fuzzing against real workbooks
+
+`fuzz/merge_fuzz.py` runs the merge over a folder of real spreadsheets. For each one it makes two branches with random cell edits, merges them, and checks the result: it opens, every edit from both sides is there with its exact type and value, nothing else changed, no chart, table or pivot was lost, and the conflicts reported are exactly the cells both sides changed.
+
+```bash
+pip install py7zr
+fuzz/fetch_corpus.sh corpus            # ~17,000 workbooks: Enron corpus + open-source test suites
+python fuzz/merge_fuzz.py corpus --keep failed/
+```
+
+`--keep` saves the base, ours, theirs and merged files of every failure. `--rounds N` tries N different random edits per workbook.
+
 ## Limits
 
 - Formatting changes their branch made to existing cells come over only when both branches have the same set of styles. Otherwise your formatting is kept.

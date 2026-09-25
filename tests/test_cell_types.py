@@ -117,3 +117,21 @@ def test_sheet_with_no_part(tmp_path):
                 z.writestr(n, d)
     assert xlgit.merge(*paths) == 0
     assert xlgit.read_cells(paths[1])["Data"]["A1"] == 2
+
+
+def test_external_entities_are_never_read(tmp_path):
+    # A workbook in a pull request must not be able to pull runner files
+    # into the diff comment.
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOPSECRET")
+    path = book(tmp_path / "evil.xlsx", {"A1": "x"})
+    with zipfile.ZipFile(path) as z:
+        parts = {n: z.read(n) for n in z.namelist()}
+    doctype = f'<!DOCTYPE sst [<!ENTITY e SYSTEM "{secret.as_uri()}">]>'.encode()
+    sst = parts["xl/sharedStrings.xml"]
+    sst = sst.replace(b"?>", b"?>" + doctype, 1).replace(b">x<", b">&e;<")
+    parts["xl/sharedStrings.xml"] = sst
+    with zipfile.ZipFile(path, "w") as z:
+        for n, d in parts.items():
+            z.writestr(n, d)
+    assert "TOPSECRET" not in repr(xlgit.read_cells(path))
