@@ -44,7 +44,7 @@ jobs:
             name: xlgit-windows.exe
           - os: macos-latest
             name: xlgit-macos-arm64
-          - os: macos-13
+          - os: macos-15-intel
             name: xlgit-macos-intel
           - os: ubuntu-latest
             name: xlgit-linux
