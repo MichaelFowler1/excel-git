@@ -133,8 +133,9 @@ def raw_value(c, sst, ref=None, shared=None):
 
 
 def same(a, b):
+    """Equal as Excel sees it: numbers to 15 significant digits."""
     if a and b and a[0] == b[0] == "n":
-        return a[1] == b[1] or math.isclose(a[1], b[1], rel_tol=1e-15, abs_tol=0)
+        return a[1] == b[1] or f"{a[1]:.15g}" == f"{b[1]:.15g}"
     return a == b
 
 
@@ -850,8 +851,11 @@ def verify_three_way(data, obytes, tbytes, merged, mg, known_problems):
         raise Check(f"merged: {worse[0].split(':', 1)[0]}", "; ".join(worse)[:300])
     bpkg, opkg, tpkg, mpkg = (xlgit.Package(x) for x in (data, obytes, tbytes, merged))
     bv, ov, tv, mv = (sheet_values(p) for p in (bpkg, opkg, tpkg, mpkg))
-    pivots = {n: xlgit.pivot_locations(p, part) for pk in (bpkg, opkg, tpkg) for n, _, part in pk.sheets()
-              for p in [pk] if part}
+    pivots = collections.defaultdict(list)  # a pivot's cells never conflict in any version
+    for pk in (bpkg, opkg, tpkg):
+        for n, _, part in pk.sheets():
+            if part:
+                pivots[n] += xlgit.pivot_locations(pk, part)
     conflicts = {(s, c) for s, c, *_ in mg.conflicts}
     for sheet in ov:
         if sheet not in mv:

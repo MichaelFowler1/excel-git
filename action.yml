@@ -1,0 +1,55 @@
+name: Excel diff (xlgit)
+description: Comment on pull requests with a cell-by-cell list of what changed in Excel workbooks.
+author: Michael Fowler
+branding:
+  icon: grid
+  color: green
+
+inputs:
+  token:
+    description: Token used to post the comment.
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install xlgit
+      shell: bash
+      run: python -m pip install --quiet "$GITHUB_ACTION_PATH"
+
+    - name: List changed cells
+      shell: bash
+      env:
+        BASE: ${{ github.event.pull_request.base.sha }}
+        HEAD: ${{ github.event.pull_request.head.sha }}
+      run: |
+        if [ -z "$BASE" ]; then
+          echo "xlgit: this action comments on pull requests; run it on pull_request events." >&2
+          exit 0
+        fi
+        xlgit pr-comment "$BASE" "$HEAD" > "$RUNNER_TEMP/xlgit-comment.md"
+        cat "$RUNNER_TEMP/xlgit-comment.md" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Post or update the comment
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PR: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        [ -n "$PR" ] || exit 0
+        # Update our earlier comment instead of adding a new one on every push.
+        id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+               --jq '.[] | select(.body | startswith("<!-- xlgit-pr-comment -->")) | .id' | tail -n 1)
+        if [ -n "$id" ]; then
+          gh api -X PATCH "repos/$REPO/issues/comments/$id" -F "body=@$RUNNER_TEMP/xlgit-comment.md" > /dev/null \
+            && exit 0
+        else
+          gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/xlgit-comment.md" && exit 0
+        fi
+        # Pull requests from forks get a read-only token: the diff is in the job summary instead.
+        echo "::notice::Couldn't comment on the pull request (read-only token, e.g. from a fork). The changed cells are in this run's summary."

@@ -75,7 +75,7 @@ class Repo:
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.email", "t@t")
         self.git("config", "user.name", "t")
-        subprocess.run([sys.executable, str(XLGIT), "install"], cwd=root, check=True, capture_output=True)
+        subprocess.run([sys.executable, str(XLGIT), "install", "--repo"], cwd=root, check=True, capture_output=True)
         self.book = root / "budget.xlsx"
 
     def git(self, *args, check=True):

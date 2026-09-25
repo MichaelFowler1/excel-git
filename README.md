@@ -1,6 +1,6 @@
 # xlgit
 
-> Beta (0.1.0). It's tested end to end, but it hasn't met many real-world workbooks yet. Git keeps every version, so a bad merge can always be undone. Please [open an issue](https://github.com/MichaelFowler1/excel-git/issues) when something looks wrong.
+> Beta (0.1.0). Every release is fuzz-tested against thousands of real-world workbooks, but you'll still find cases it gets wrong. Git keeps every version, so a bad merge can always be undone. Please [open an issue](https://github.com/MichaelFowler1/excel-git/issues) when something looks wrong.
 
 Git and GitHub treat `.xlsx` as an opaque binary blob. You can commit, fork and branch it, but a diff just says "binary file changed" and any merge where both sides touched the file is a conflict. This fixes that.
 
@@ -17,6 +17,48 @@ Git and GitHub treat `.xlsx` as an opaque binary blob. You can commit, fork and 
 
 Formulas are compared as formulas (`=B2+C2`), not their cached results.
 
+## Get started
+
+You need [Python](https://www.python.org/downloads/) 3.9 or newer and git. Then, once per computer:
+
+```bash
+pip install xlgit
+xlgit install
+```
+
+That's it. Every git repository on this computer now understands `.xlsx` and `.xlsm` files, including ones you clone or create later. Keep using git the way you already do.
+
+To also get a comment listing the changed cells on every GitHub pull request, run this once inside the repository and push:
+
+```bash
+xlgit install --github
+```
+
+Run `xlgit` on its own at any time to see the commands and check that everything is set up.
+
+## Everyday use
+
+**See what changed.** `xlgit diff` lists every cell that changed in your workbooks since the last commit. `git diff`, `git log -p` and `git show` show cell changes too.
+
+```
+$ xlgit diff
+=== budget.xlsx ===
+changed        Budget!B2  1000 -> 1100
+added          Budget!A5  (empty) -> 'Gas'
+```
+
+**Merge.** `git merge` and `git pull` combine edits from both branches cell by cell. If you changed different cells, there's nothing to do.
+
+**When both of you changed the same cell**, git stops and xlgit tells you which cells:
+
+```
+xlgit merged budget.xlsx: took 3 cell(s) from the other branch, but 1 change(s) clash.
+  Budget B2: yours 1100, theirs 1200 (was 1000)
+  Your values were kept. Every clash is listed, with a link, on the sheet '_merge_conflicts'.
+```
+
+Open the workbook, go through the `_merge_conflicts` sheet (each row links to its cell), fix the cells, delete that sheet, save, then run `git add budget.xlsx` and `git commit`. Git keeps every version, so nothing is ever lost: `git merge --abort` undoes the whole merge.
+
 ## How the merge works
 
 A workbook is a zip of XML files: one per sheet, one per chart, one per image and so on. Instead of re-saving the whole thing through a spreadsheet library (which is how charts used to get lost), xlgit starts from your copy's zip and only rewrites the XML that has to change:
@@ -32,30 +74,48 @@ Writers renumber a workbook's internal files on every save (add a chart to an ea
 
 Excel recalculates every formula and refreshes affected pivot tables when it opens the merged file.
 
-## Setup
-
-Install it (Python 3.9 or newer), then run `install` inside any repo holding Excel files:
-
-```bash
-pip install xlgit
-xlgit install
-```
-
-That writes a `.gitattributes` entry and registers the diff and merge drivers in `.git/config`. The config part is per clone, so each collaborator runs `xlgit install` once. The `.gitattributes` part gets committed.
-
-Don't want a package? `xlgit.py` is a single file. Copy it in, `pip install openpyxl lxml`, and run `python xlgit.py install`.
-
-For the GitHub side, copy `.github/workflows/excel-diff.yml`, `requirements.txt` and `xlgit.py` into the repo root. Every PR that touches a workbook gets a cell-diff comment.
-
 ## Commands
 
 ```
-xlgit textconv book.xlsx          # dump as text
-xlgit diff old.xlsx new.xlsx      # list cell and object changes
-xlgit diff a.xlsx b.xlsx --markdown
-xlgit merge base.xlsx ours.xlsx theirs.xlsx
+xlgit                        help, and whether everything is set up
+xlgit install                set up every repository on this computer (once)
+xlgit install --github       add pull request comments to this repository
+xlgit install --repo         set up only this repository
+xlgit uninstall [--repo]     undo the setup
+xlgit diff                   what changed in your workbooks since the last commit
+xlgit diff FILE              ... in one workbook
+xlgit diff OLD NEW           compare any two workbooks (--markdown for a table)
 xlgit --version
 ```
+
+Git runs `xlgit textconv` and `xlgit merge` itself; you don't need to.
+
+Don't want a package? `xlgit.py` is a single file. Copy it in, `pip install openpyxl lxml`, and run `python xlgit.py install`.
+
+### The GitHub Action
+
+`xlgit install --github` writes this workflow. You can also add it by hand:
+
+```yaml
+# .github/workflows/excel-diff.yml
+name: Excel diff
+on:
+  pull_request:
+    paths: ["**/*.xlsx", "**/*.xlsm"]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  excel-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: MichaelFowler1/excel-git@v0.1.0
+```
+
+It keeps one comment per pull request up to date as you push. Pull requests from forks can't be commented on with GitHub's default token, so for those the changed cells go in the run's summary page instead.
 
 ## Tests
 

@@ -2,11 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """xlgit: make Excel workbooks behave like code in git and GitHub.
 
-Commands:
-  textconv FILE                    print a workbook as diffable text (git diff driver)
-  diff OLD NEW [--markdown]        cell and object (chart/table/pivot/...) diff
-  merge BASE OURS THEIRS [PATH]    3-way merge (git merge driver)
-  install                          wire the drivers into the current git repo
+Run `xlgit` for help. Set up once with `xlgit install`; after that git diff
+and git merge understand .xlsx/.xlsm files in every repository.
 
 The merge edits the workbook's XML parts in place instead of re-saving it
 through a spreadsheet library, so charts, images, formatting, comments,
@@ -447,8 +444,15 @@ class DateNum(float):
 
 
 def same(a, b):
-    """Cell values are equal, with TRUE never equal to 1."""
-    return a == b and (type(a) is bool) == (type(b) is bool)
+    """Cell values are equal, with TRUE never equal to 1. Numbers are
+    compared to 15 significant digits, the precision Excel works to:
+    LibreOffice saves 0.1+0.2 as 0.3 where Excel saves 0.30000000000000004,
+    and that isn't a change anyone made."""
+    if (type(a) is bool) != (type(b) is bool):
+        return False
+    if a == b:
+        return True
+    return isinstance(a, (int, float)) and isinstance(b, (int, float)) and f"{a:.15g}" == f"{b:.15g}"
 
 
 def same_cells(a, b):
@@ -809,15 +813,19 @@ def diff(old_path, new_path, markdown=False, title=None):
         print("| Sheet | Cell | Change | Before | After |")
         print("|---|---|---|---|---|")
         for kind, sheet, coord, ov, nv, raw in changes[:500]:
-            esc = lambda v: show(v, raw).replace("|", "\\|")
-            print(f"| {sheet} | {coord} | {kind} | {esc(ov)} | {esc(nv)} |")
+            esc = lambda v: str(v).replace("|", "\\|").replace("\r", "").replace("\n", "<br>")
+            print(f"| {esc(sheet)} | {coord} | {kind} | {esc(show(ov, raw))} | {esc(show(nv, raw))} |")
         if len(changes) > 500:
             print(f"\n...and {len(changes) - 500} more.")
         print()
     else:
         for kind, sheet, coord, ov, nv, raw in changes:
-            where = f"{sheet}!{coord}" if coord else sheet
-            print(f"{kind:14} {where}  {show(ov, raw)} -> {show(nv, raw)}")
+            if raw:  # a chart, table, comment...
+                print(f"{kind:14} {sheet}  {nv if nv is not None else ov}")
+            elif not coord:  # a whole sheet
+                print(f"{kind:14} {sheet}")
+            else:
+                print(f"{kind:14} {sheet}!{coord}  {fmt(ov)} -> {fmt(nv)}")
     return 1 if changes else 0
 
 
@@ -1941,70 +1949,374 @@ class Merger:
 def merge(base_path, ours_path, theirs_path, display_path=None):
     """Write the merge of THEIRS into OURS over OURS (git's convention).
     Exit 0 = clean, 1 = conflicts (listed in a _merge_conflicts sheet)."""
-    mg = Merger(base_path, ours_path, theirs_path)
-    data = mg.run()
+    name = display_path or ours_path
+    try:
+        mg = Merger(base_path, ours_path, theirs_path)
+        data = mg.run()
+    except Exception as e:  # never leave a half-written workbook behind
+        say(f"xlgit couldn't merge {name} automatically ({_reason(e)}).\n"
+            f"  Your version is kept, unchanged. To take theirs instead:\n"
+            f"    git checkout --theirs -- \"{name}\"\n"
+            f"  Then: git add \"{name}\"  and  git commit\n"
+            f"  Please report this at {ISSUES} so it can be fixed.")
+        return 1
     with open(ours_path, "wb") as f:
         f.write(data)
-    name = display_path or ours_path
-    print(f"xlgit merge {name}: {mg.cells_taken} cell(s) and {len(mg.objects_taken)} object(s) "
-          f"taken from theirs, {len(mg.conflicts)} conflict(s)", file=sys.stderr)
+    took = f"{mg.cells_taken} cell(s)" + (f" and {len(mg.objects_taken)} object(s)" if mg.objects_taken else "")
+    if not mg.conflicts:
+        say(f"xlgit merged {name}: took {took} from the other branch, no conflicts.")
     for note in mg.notes:
-        print(f"  note: {note}", file=sys.stderr)
-    for sheet, coord, bv, ov, tv in mg.conflicts:
-        print(f"  CONFLICT {sheet} {coord}: base={fmt(bv)} ours={fmt(ov)} theirs={fmt(tv)}", file=sys.stderr)
+        say(f"  note: {note}")
+    if mg.conflicts:
+        say(f"xlgit merged {name}: took {took} from the other branch, but "
+            f"{len(mg.conflicts)} change(s) clash.")
+        for sheet, coord, bv, ov, tv in mg.conflicts[:20]:
+            say(f"  {sheet} {coord}: yours {fmt(ov)}, theirs {fmt(tv)} (was {fmt(bv)})")
+        if len(mg.conflicts) > 20:
+            say(f"  ...and {len(mg.conflicts) - 20} more.")
+        say(f"  Your values were kept. Every clash is listed, with a link, on the sheet {CONFLICT_SHEET!r}.\n"
+            f"  To finish: open {name}, fix those cells, delete the {CONFLICT_SHEET} sheet, save, then\n"
+            f"    git add \"{name}\"\n"
+            f"    git commit")
     return 1 if mg.conflicts else 0
 
 
-# ---------- install ----------
+def say(msg):
+    print(msg, file=sys.stderr)
 
-def install():
+
+def _reason(e):
+    if isinstance(e, zipfile.BadZipFile):
+        return "it isn't an .xlsx/.xlsm workbook; old .xls files aren't supported, save as .xlsx"
+    if isinstance(e, etree.XMLSyntaxError):
+        return f"the workbook is damaged: {e}"
+    return f"{type(e).__name__}: {e}"
+
+
+# ---------- setup ----------
+
+ISSUES = "https://github.com/MichaelFowler1/excel-git/issues"
+ACTION = "MichaelFowler1/excel-git"
+ATTR_LINES = [f"{ext} diff=xlsx merge=xlsx" for ext in EXTS]
+WORKFLOW = f"""\
+# Posts a cell-by-cell diff of changed Excel workbooks on every pull request.
+# Made by `xlgit install --github`; see https://github.com/{ACTION}
+name: Excel diff
+
+on:
+  pull_request:
+    paths: ["**/*.xlsx", "**/*.xlsm", "**/*.XLSX", "**/*.XLSM"]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  excel-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: {ACTION}@v{__version__}
+"""
+
+
+def git(*args, check=True):
+    r = subprocess.run(["git", *args], capture_output=True)
+    if check and r.returncode:
+        raise UserError(r.stderr.decode(errors="replace").strip() or f"git {' '.join(args)} failed")
+    return r.stdout
+
+
+class UserError(Exception):
+    """A problem the user can fix; shown without a traceback."""
+
+
+def repo_root():
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def global_attributes_file():
+    """The attributes file git reads for every repository."""
+    configured = git("config", "--global", "--get", "core.attributesFile", check=False).decode().strip()
+    if configured:
+        return os.path.expanduser(configured)
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(xdg, "git", "attributes")
+
+
+def _add_lines(path, lines):
+    existing = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+    missing = [ln for ln in lines if ln not in existing.splitlines()]
+    if missing:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            f.write("\n".join(missing) + "\n")
+
+
+def _remove_lines(path, lines):
+    if os.path.exists(path):
+        kept = [ln for ln in open(path, encoding="utf-8").read().splitlines() if ln not in lines]
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("".join(ln + "\n" for ln in kept))
+
+
+def install(scope="global"):
     here = os.path.abspath(__file__).replace("\\", "/")
     py = sys.executable.replace("\\", "/")
     cmd = f'"{py}" "{here}"'
-    subprocess.check_call(["git", "config", "diff.xlsx.textconv", f"{cmd} textconv"])
-    subprocess.check_call(["git", "config", "diff.xlsx.binary", "true"])
-    subprocess.check_call(["git", "config", "merge.xlsx.name", "xlgit cell-level merge"])
-    subprocess.check_call(["git", "config", "merge.xlsx.driver", f"{cmd} merge %O %A %B %P"])
-    top = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
-    attrs = os.path.join(top, ".gitattributes")
-    existing = open(attrs).read() if os.path.exists(attrs) else ""
-    with open(attrs, "a") as f:
-        for ext in EXTS:
-            line = f"{ext} diff=xlsx merge=xlsx"
-            if line not in existing:
-                f.write(line + "\n")
-    print("xlgit installed: git diff / git merge now understand .xlsx/.xlsm in this repo.")
+    where = ["--global"] if scope == "global" else []
+    root = repo_root()
+    if scope == "repo" and not root:
+        raise UserError("this folder isn't inside a git repository. Run it inside one, "
+                        "or run `xlgit install` to set up every repository on this computer.")
+    for key, value in (("diff.xlsx.textconv", f"{cmd} textconv"), ("diff.xlsx.binary", "true"),
+                       ("merge.xlsx.name", "xlgit cell-level merge"),
+                       ("merge.xlsx.driver", f"{cmd} merge %O %A %B %P")):
+        git("config", *where, key, value)
+    if scope == "global":
+        _add_lines(global_attributes_file(), ATTR_LINES)
+        print("xlgit is set up for every git repository on this computer.\n"
+              "  git diff now lists changed cells in .xlsx/.xlsm files, and git merge combines\n"
+              "  edits from different branches cell by cell.\n"
+              "  Teammates run the same two commands once:  pip install xlgit  and  xlgit install")
+    else:
+        _add_lines(os.path.join(root, ".gitattributes"), ATTR_LINES)
+        print("xlgit is set up for this repository. Commit .gitattributes so it applies to teammates too;\n"
+              "  each of them runs `xlgit install` once on their own computer.")
 
+
+def install_github():
+    root = repo_root()
+    if not root:
+        raise UserError("run this inside the git repository you want pull request comments for.")
+    path = os.path.join(root, ".github", "workflows", "excel-diff.yml")
+    if os.path.exists(path):
+        print(f"{os.path.relpath(path)} already exists; left as it is.")
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(WORKFLOW)
+    _add_lines(os.path.join(root, ".gitattributes"), ATTR_LINES)
+    rel = os.path.relpath(path, root).replace("\\", "/")
+    print(f"Added {rel}. Commit and push it:\n"
+          f"    git add {rel} .gitattributes\n"
+          f"    git commit -m \"Show Excel changes on pull requests\"\n"
+          f"    git push\n"
+          f"  Every pull request that changes a workbook then gets a comment listing the changed cells.")
+
+
+def uninstall(scope="global"):
+    where = ["--global"] if scope == "global" else []
+    for section in ("diff.xlsx", "merge.xlsx"):
+        git("config", *where, "--remove-section", section, check=False)
+    if scope == "global":
+        _remove_lines(global_attributes_file(), ATTR_LINES)
+        print("xlgit is no longer set up globally. (Repositories set up with --repo keep their setup.)")
+    else:
+        root = repo_root()
+        if root:
+            _remove_lines(os.path.join(root, ".gitattributes"), ATTR_LINES)
+        print("xlgit is no longer set up for this repository.")
+
+
+def status_lines():
+    driver = git("config", "--get", "merge.xlsx.driver", check=False).decode().strip()
+    root = repo_root()
+    out = []
+    if not driver:
+        out.append("[--] Not set up yet. Run:  xlgit install")
+        return out
+    exe = re.findall(r'"([^"]+)"', driver)
+    if exe and not all(os.path.exists(p) for p in exe):
+        out.append("[!!] Set up, but pointing at a Python or xlgit that no longer exists. Run:  xlgit install")
+        return out
+    scope = "every repository" if git("config", "--global", "--get", "merge.xlsx.driver",
+                                          check=False).strip() else "this repository"
+    out.append(f"[ok] Set up for {scope}.")
+    if root:
+        attr = git("check-attr", "merge", "--", "x.xlsx", check=False).decode()
+        if "xlsx" not in attr:
+            out.append("[!!] .xlsx files in this repository aren't using xlgit. Run:  xlgit install")
+        if not os.path.exists(os.path.join(root, ".github", "workflows", "excel-diff.yml")):
+            out.append("[  ] Pull request comments: not set up here. Optional:  xlgit install --github")
+        else:
+            out.append("[ok] Pull request comments are set up in this repository.")
+    return out
+
+
+HELP = f"""\
+xlgit {__version__}: see and merge changes inside Excel files with git.
+
+Set up (once per computer):
+  xlgit install              git diff and git merge understand .xlsx/.xlsm in every repository
+  xlgit install --github     also comment the changed cells on this repository's pull requests
+
+Everyday:
+  git diff, git merge, git pull   work as usual, cell by cell
+  xlgit diff                 what changed in your workbooks since the last commit
+  xlgit diff FILE            ... in one workbook
+  xlgit diff OLD NEW         compare any two workbooks
+
+More:
+  xlgit install --repo       set up only the current repository
+  xlgit uninstall [--repo]   undo the setup
+  xlgit --version
+
+Help and bug reports: {ISSUES}
+"""
+
+
+# ---------- diff against git ----------
+
+def _git_blob(rev, path):
+    r = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True)
+    return r.stdout if r.returncode == 0 else b""
+
+
+def _changed_workbooks(*revs):
+    names = git("diff", "--name-only", "-z", *revs).decode("utf-8", "replace").split("\0")
+    return [n for n in names if n.lower().endswith((".xlsx", ".xlsm"))]
+
+
+def _diff_blobs(old, new, title, markdown):
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        a, b = os.path.join(td, "old"), os.path.join(td, "new")
+        with open(a, "wb") as f:
+            f.write(old)
+        with open(b, "wb") as f:
+            f.write(new)
+        if not markdown:
+            print(f"=== {title} ===")
+        try:
+            return diff(a, b, markdown=markdown, title=title)
+        except Exception as e:
+            print(f"(couldn't compare {title}: {_reason(e)})\n")
+            return 0
+
+
+def diff_worktree(paths=()):
+    """Workbooks changed since the last commit (or new and untracked)."""
+    root = repo_root()
+    if not root:
+        raise UserError("not inside a git repository. To compare two files: xlgit diff OLD NEW")
+    os.chdir(root)
+    has_head = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], capture_output=True).returncode == 0
+    if paths:
+        files = [os.path.relpath(os.path.abspath(p), root).replace("\\", "/") for p in paths]
+    else:
+        files = _changed_workbooks("HEAD") if has_head else []
+        untracked = git("ls-files", "--others", "--exclude-standard", "-z").decode("utf-8", "replace").split("\0")
+        files += [n for n in untracked if n.lower().endswith((".xlsx", ".xlsm")) and n not in files]
+    if not files:
+        print("No workbook changes since the last commit.")
+        return 0
+    changed = 0
+    for f in files:
+        new = open(f, "rb").read() if os.path.exists(f) else b""
+        changed |= _diff_blobs(_git_blob("HEAD", f) if has_head else b"", new, f, markdown=False)
+    return changed
+
+
+MARKER = "<!-- xlgit-pr-comment -->"
+
+
+def pr_comment(base, head, limit=60000):
+    """Markdown for a pull request: every workbook the PR changes."""
+    mb = git("merge-base", base, head, check=False).decode().strip() or base
+    out = io.StringIO()
+    from contextlib import redirect_stdout
+    files = _changed_workbooks(f"{mb}...{head}") if mb != base else _changed_workbooks(base, head)
+    with redirect_stdout(out):
+        print(MARKER)
+        print("## Excel changes in this pull request\n")
+        if not files:
+            print("No workbook changes.")
+        for f in files:
+            _diff_blobs(_git_blob(mb, f), _git_blob(head, f), f, markdown=True)
+    text = out.getvalue()
+    if len(text) > limit:
+        text = text[:limit].rsplit("\n", 1)[0] + "\n\n...cut short: GitHub comments have a size limit.\n"
+    return text
+
+
+# ---------- command line ----------
 
 def main(argv):
-    if not argv:
-        print(__doc__)
-        return 2
-    cmd, args = argv[0], argv[1:]
-    if cmd in ("--version", "version"):
+    flags = {a for a in argv if a.startswith("--")}
+    args = [a for a in argv if not a.startswith("--")]
+    cmd = args.pop(0) if args else None
+    if "--version" in flags or cmd == "version":
         print(f"xlgit {__version__}")
         return 0
+    if cmd is None or cmd == "help" or "--help" in flags or "-h" in args:
+        print(HELP)
+        for line in status_lines():
+            print(line)
+        return 0
     if cmd == "textconv":
-        textconv(args[0])
+        # git diff and git log -p call this; never fail them over one bad file.
+        try:
+            textconv(args[0])
+        except Exception as e:
+            print(f"(xlgit couldn't read this file: {_reason(e)})")
         return 0
-    if cmd == "diff":
-        md = "--markdown" in args
-        paths = [a for a in args if not a.startswith("--")]
-        title = next((a.split("=", 1)[1] for a in args if a.startswith("--title=")), None)
-        rc = diff(paths[0], paths[1], markdown=md, title=title)
-        return 0 if md else rc
     if cmd == "merge":
+        if len(args) < 3:
+            raise UserError("merge needs BASE OURS THEIRS (git passes these itself).")
         return merge(*args[:4])
-    if cmd == "install":
-        install()
+    if cmd == "diff":
+        if len(args) == 2:
+            title = next((a.split("=", 1)[1] for a in flags if a.startswith("--title=")), None)
+            for p in args:
+                if not os.path.exists(p):
+                    raise UserError(f"no such file: {p}")
+            rc = diff(args[0], args[1], markdown="--markdown" in flags, title=title)
+            return 0 if "--markdown" in flags else rc
+        return diff_worktree(args)
+    if cmd == "pr-comment":
+        if len(args) != 2:
+            raise UserError("usage: xlgit pr-comment BASE HEAD")
+        sys.stdout.write(pr_comment(*args))
         return 0
-    print(__doc__)
-    return 2
+    if cmd == "install":
+        if "--github" in flags:
+            if not git("config", "--get", "merge.xlsx.driver", check=False).strip():
+                install("repo" if "--repo" in flags else "global")
+            install_github()
+        else:
+            install("repo" if "--repo" in flags else "global")
+        return 0
+    if cmd == "uninstall":
+        uninstall("repo" if "--repo" in flags else "global")
+        return 0
+    if cmd == "status":
+        for line in status_lines():
+            print(line)
+        return 0
+    raise UserError(f"unknown command {cmd!r}. Run `xlgit` to see what it can do.")
 
 
 def cli():
     """Entry point for the installed `xlgit` command."""
-    sys.exit(main(sys.argv[1:]))
+    try:
+        code = main(sys.argv[1:])
+    except UserError as e:
+        say(f"xlgit: {e}")
+        code = 2
+    except KeyboardInterrupt:
+        code = 130
+    except Exception as e:
+        if os.environ.get("XLGIT_DEBUG"):
+            raise
+        say(f"xlgit: {_reason(e)}\n  (set XLGIT_DEBUG=1 for details; please report it at {ISSUES})")
+        code = 1
+    sys.exit(code)
 
 
 if __name__ == "__main__":

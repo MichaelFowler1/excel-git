@@ -1,47 +1,21 @@
+# Posts a cell-by-cell diff of changed Excel workbooks on every pull request.
+# This repository uses its own action from the checkout; other repositories
+# get this file from `xlgit install --github`, which uses the published one.
 name: Excel diff
 
-# On every pull request, post a cell-by-cell diff of any changed Excel
-# workbooks as a PR comment, since GitHub's own diff view shows "binary file".
 on:
   pull_request:
-    paths: ["**/*.xlsx", "**/*.xlsm"]
+    paths: ["**/*.xlsx", "**/*.xlsm", "**/*.XLSX", "**/*.XLSM"]
 
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
-  diff:
+  excel-diff:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -r requirements.txt
-
-      - name: Build cell diff
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-        run: |
-          mkdir -p /tmp/xl
-          echo "## Excel changes in this PR" > /tmp/xl/comment.md
-          echo "" >> /tmp/xl/comment.md
-          git diff --name-only "$BASE" "$HEAD" -- '*.xlsx' '*.xlsm' | while read -r f; do
-            git show "$BASE:$f" > /tmp/xl/old 2>/dev/null || : > /tmp/xl/old
-            git show "$HEAD:$f" > /tmp/xl/new 2>/dev/null || : > /tmp/xl/new
-            python xlgit.py diff /tmp/xl/old /tmp/xl/new --markdown "--title=$f" >> /tmp/xl/comment.md
-          done
-          # GitHub comments max out at 65536 chars
-          head -c 60000 /tmp/xl/comment.md > /tmp/xl/body.md
-
-      - name: Post or update PR comment
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          gh pr comment "$PR" --edit-last --body-file /tmp/xl/body.md \
-            || gh pr comment "$PR" --body-file /tmp/xl/body.md
+      - uses: ./
