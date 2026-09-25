@@ -1,4 +1,6 @@
-# excel-git
+# xlgit
+
+> Beta (0.1.0). It's tested end to end, but it hasn't met many real-world workbooks yet. Git keeps every version, so a bad merge can always be undone. Please [open an issue](https://github.com/MichaelFowler1/excel-git/issues) when something looks wrong.
 
 Git and GitHub treat `.xlsx` as an opaque binary blob. You can commit, fork and branch it, but a diff just says "binary file changed" and any merge where both sides touched the file is a conflict. This fixes that.
 
@@ -32,24 +34,27 @@ Excel recalculates every formula and refreshes affected pivot tables when it ope
 
 ## Setup
 
-In any repo holding Excel files:
+Install it (Python 3.9 or newer), then run `install` inside any repo holding Excel files:
 
 ```bash
-pip install openpyxl lxml
-python path/to/xlgit.py install
+pip install xlgit
+xlgit install
 ```
 
-That writes a `.gitattributes` entry and registers the diff and merge drivers in `.git/config`. The config part is per clone, so each collaborator runs `install` once. The `.gitattributes` part gets committed.
+That writes a `.gitattributes` entry and registers the diff and merge drivers in `.git/config`. The config part is per clone, so each collaborator runs `xlgit install` once. The `.gitattributes` part gets committed.
+
+Don't want a package? `xlgit.py` is a single file. Copy it in, `pip install openpyxl lxml`, and run `python xlgit.py install`.
 
 For the GitHub side, copy `.github/workflows/excel-diff.yml`, `requirements.txt` and `xlgit.py` into the repo root. Every PR that touches a workbook gets a cell-diff comment.
 
 ## Commands
 
 ```
-python xlgit.py textconv book.xlsx          # dump as text
-python xlgit.py diff old.xlsx new.xlsx      # list cell and object changes
-python xlgit.py diff a.xlsx b.xlsx --markdown
-python xlgit.py merge base.xlsx ours.xlsx theirs.xlsx
+xlgit textconv book.xlsx          # dump as text
+xlgit diff old.xlsx new.xlsx      # list cell and object changes
+xlgit diff a.xlsx b.xlsx --markdown
+xlgit merge base.xlsx ours.xlsx theirs.xlsx
+xlgit --version
 ```
 
 ## Tests

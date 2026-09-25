@@ -31,6 +31,8 @@ from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to_excel
 from openpyxl.worksheet.formula import ArrayFormula
 
+__version__ = "0.1.0"
+
 EXTS = ("*.xlsx", "*.xlsm")
 
 MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -1762,6 +1764,9 @@ def main(argv):
         print(__doc__)
         return 2
     cmd, args = argv[0], argv[1:]
+    if cmd in ("--version", "version"):
+        print(f"xlgit {__version__}")
+        return 0
     if cmd == "textconv":
         textconv(args[0])
         return 0
@@ -1780,5 +1785,10 @@ def main(argv):
     return 2
 
 
-if __name__ == "__main__":
+def cli():
+    """Entry point for the installed `xlgit` command."""
     sys.exit(main(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    cli()

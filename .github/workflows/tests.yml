@@ -17,3 +17,11 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest tests -q
+      - name: Package builds and installs
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+          pip install dist/*.whl
+          xlgit --version
+        shell: bash

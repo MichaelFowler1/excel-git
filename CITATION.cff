@@ -7,6 +7,7 @@ authors:
     given-names: Michael
 repository-code: "https://github.com/MichaelFowler1/excel-git"
 license: Apache-2.0
+version: 0.1.0
 abstract: >-
   xlgit makes Excel workbooks work like code in git and GitHub. It diffs
   workbooks cell by cell and merges branches automatically, keeping charts,
