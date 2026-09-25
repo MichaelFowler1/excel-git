@@ -10,7 +10,7 @@ The items are in rough order. Nothing here has a date. If you want to help with 
 
 ### 1. Test against thousands of real workbooks
 
-Done for the first round: `fuzz/merge_fuzz.py` runs the merge over the Enron corpus and the test files of other spreadsheet libraries (about 17,000 workbooks), and found and fixed a dozen bugs before launch. Next: FUSE, and opening merged files in real Excel. The approach: run the merge driver over public collections of real spreadsheets, such as the Enron corpus and FUSE. Each file gets random edits on two branches, is merged, and the result is checked: it opens, nothing was lost, and every edit from both sides is there. Most of the Enron files are the old `.xls` format, so the `.xlsx` files in these collections do most of the work.
+Done for the first round: `fuzz/merge_fuzz.py` gives each workbook random edits on two branches, merges them, and checks the result opens, lost nothing and has every edit from both sides. It has run over about 3,000 real workbooks so far (a sample of the Enron corpus plus the test files of other spreadsheet libraries), and found and fixed a dozen bugs before launch. Next: the rest of the Enron corpus (about 16,000 files), FUSE, and opening merged files in real Excel.
 
 ### 2. Understand inserted, deleted and moved rows
 
