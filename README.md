@@ -70,3 +70,11 @@ The tests build workbook versions with charts, comments and named ranges, run re
 - If both branches added a chart to a sheet that had none, only yours is kept (flagged).
 - Inserting a row shows up as many changed cells, because every cell below it moves.
 - `.xls` (the old pre-2007 format) isn't supported. Save as `.xlsx`.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
+
+You can use, change and ship xlgit, including commercially. If you pass it on, modified or not, keep the [NOTICE](NOTICE) file and the copyright line at the top of `xlgit.py` with it. The license doesn't grant use of the xlgit name for your own version.
+
+Created by Michael Fowler.

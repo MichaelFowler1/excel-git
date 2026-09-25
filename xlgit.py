@@ -1,3 +1,5 @@
+# Copyright 2026 Michael Fowler
+# SPDX-License-Identifier: Apache-2.0
 """xlgit: make Excel workbooks behave like code in git and GitHub.
 
 Commands:
