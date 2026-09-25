@@ -894,11 +894,11 @@ def _shape(v, row, cache):
     return ("v", v)
 
 
-def _aligned_diff(orows, nrows, limit=50000):
+def _align(orows, nrows, cache):
+    """Line up two sheets' rows by content. Returns sorted row numbers of
+    each side and index lists: pairs (same row), lone_old (deleted),
+    lone_new (inserted), moved (i, j)."""
     import difflib
-    if len(orows) > limit or len(nrows) > limit:
-        return None
-    cache = {}
     shape_row = lambda row, r: tuple(sorted((c, _shape(v, r, cache)) for c, v in row.items()))
     ro, rn = sorted(orows), sorted(nrows)
     ok = [shape_row(orows[r], r) for r in ro]
@@ -924,7 +924,6 @@ def _aligned_diff(orows, nrows, limit=50000):
                 pairs.append((i, best))
                 j = best + 1
         lone_new += range(j, j2)
-    out = []
     # A deleted row that reappears unchanged elsewhere was moved.
     moved = []
     for i in list(lone_old):
@@ -933,6 +932,14 @@ def _aligned_diff(orows, nrows, limit=50000):
             lone_old.remove(i)
             lone_new.remove(match)
             moved.append((i, match))
+    return ro, rn, pairs, lone_old, lone_new, moved
+
+
+def _aligned_diff(orows, nrows, limit=50000):
+    if len(orows) > limit or len(nrows) > limit:
+        return None
+    cache = {}
+    ro, rn, pairs, lone_old, lone_new, moved = _align(orows, nrows, cache)
     def summary(row, show=6):
         cols = sorted(row)
         text = ", ".join(f"{get_column_letter(c)}: {fmt(row[c])}" for c in cols[:show])
@@ -1048,6 +1055,122 @@ def diff(old_path, new_path, markdown=False, title=None):
             else:
                 print(f"{kind:14} {sheet}!{coord}  {fmt(ov)} -> {fmt(nv)}")
     return 1 if changes else 0
+
+
+# ---------- following rows through a merge ----------
+
+class RowMap:
+    """Where each row of the base version ended up on a branch that inserted,
+    deleted or moved rows: r -> new row number, or None if it was deleted."""
+
+    def __init__(self, pairs, deleted):
+        self.exact = dict(pairs)
+        self.deleted = set(deleted)
+        self.anchors = sorted(self.exact.items())
+        self._keys = [b for b, _ in self.anchors]
+
+    def __call__(self, r):
+        if r in self.exact:
+            return self.exact[r]
+        if r in self.deleted:
+            return None
+        # An empty row moves with the row above it.
+        import bisect
+        i = bisect.bisect_right(self._keys, r) - 1
+        if i < 0:
+            return r
+        b, o = self.anchors[i]
+        return r + (o - b)
+
+    def start(self, r):
+        """First surviving row at or after r (a range's top edge)."""
+        for x in range(r, r + 100000):
+            if x not in self.deleted:
+                return self(x)
+        return None
+
+    def end(self, r):
+        """Last surviving row at or before r (a range's bottom edge)."""
+        for x in range(r, max(r - 100000, 0), -1):
+            if x not in self.deleted:
+                return self(x)
+        return None
+
+
+def row_map(base_cells, cells):
+    """A RowMap if this version of a sheet inserted, deleted or moved rows
+    relative to base, else None (only cells changed)."""
+    if not base_cells or not cells or same_cells(base_cells, cells):
+        return None
+    if not any(k in ROW_EVENTS for k, *_ in diff_sheet(base_cells, cells)):
+        return None
+    brows, rows = _by_row(base_cells), _by_row(cells)
+    ro, rn, pairs, lone_old, lone_new, moved = _align(brows, rows, {})
+    # Moved rows count as deleted and inserted: references to them can't be
+    # followed the way Excel would, so edits there conflict instead.
+    deleted = [ro[i] for i in lone_old] + [ro[i] for i, _ in moved]
+    return RowMap([(ro[i], rn[j]) for i, j in pairs], deleted)
+
+
+_REF_CELL = re.compile(r"^(\$?)([A-Za-z]{1,3})(\$?)(\d+)$")
+_REF_ROW = re.compile(r"^(\$?)(\d+)$")
+
+
+def _move_ref(part, fn):
+    for rx, row_group in ((_REF_CELL, 4), (_REF_ROW, 2)):
+        mt = rx.match(part)
+        if mt:
+            r = fn(int(mt.group(row_group)))
+            if r is None:
+                return None
+            groups = list(mt.groups())
+            groups[row_group - 1] = str(r)
+            return "".join(groups)
+    return part  # a whole column, a name: no rows to move
+
+
+def _ref_row(part):
+    mt = _REF_CELL.match(part) or _REF_ROW.match(part)
+    return int(mt.groups()[-1]) if mt else 0
+
+
+def rewrite_refs(formula, host, maps):
+    """Renumber a formula's row references for rows that moved, as Excel does
+    when rows are inserted or deleted. maps: {sheet name: RowMap}; host is
+    the sheet the formula sits on."""
+    if not maps or not isinstance(formula, str) or isinstance(formula, Text) or not formula.startswith("="):
+        return formula
+    try:
+        from openpyxl.formula.tokenizer import Tokenizer
+        tok = Tokenizer(formula)
+    except Exception:
+        return formula
+    changed = False
+    for t in tok.items:
+        if t.type != "OPERAND" or t.subtype != "RANGE":
+            continue
+        prefix, ref = (t.value.rsplit("!", 1) if "!" in t.value else ("", t.value))
+        if "[" in prefix or "[" in ref:
+            continue  # another workbook, or a table reference
+        sheet = prefix[1:-1].replace("''", "'") if prefix.startswith("'") else (prefix or host)
+        m = maps.get(sheet)
+        if m is None:
+            continue
+        parts = ref.split(":")
+        if len(parts) == 1:
+            new = _move_ref(parts[0], m)
+        elif len(parts) == 2:
+            a, b = _move_ref(parts[0], m.start), _move_ref(parts[1], m.end)
+            new = None if a is None or b is None or _ref_row(a) > _ref_row(b) else f"{a}:{b}"
+        else:
+            continue
+        value = (prefix + "!" if prefix else "") + (new if new is not None else "#REF!")
+        if new is None:
+            value = "#REF!"
+        if value != t.value:
+            t.value = value
+            changed = True
+    return tok.render() if changed else formula
 
 
 # ---------- visual diff ----------
@@ -1302,12 +1425,14 @@ class Merger:
     def __init__(self, base_path, ours_path, theirs_path):
         self.b, self.o, self.t = (Package.open(p) for p in (base_path, ours_path, theirs_path))
         self.bc, self.oc, self.tc = (read_package_cells(p) for p in (self.b, self.o, self.t))
+        self.notes = []
+        self.swapped = False
+        self.plan_rows()
         self.res = dict(self.o.parts)
         self.order = list(self.o.order)
         self.trees = {}
         self.imported = {}  # their part name -> part name in the result
         self.conflicts = []
-        self.notes = []
         self.cells_taken = 0
         self.objects_taken = []
         self.stale_pivots = False
@@ -1488,7 +1613,47 @@ class Merger:
         return {s.get("name"): (s, targets.get(s.get(RID))) for s in wb.find(m("sheets"))}
 
     def conflict(self, sheet, cell, base, ours, theirs):
+        if self.swapped:  # the result was built on their layout; report from your side
+            ours, theirs = theirs, ours
+            flip = lambda v: v.replace("kept ours", "kept theirs (it has their row changes)") \
+                if isinstance(v, str) and not isinstance(v, Text) else v
+            ours, theirs = flip(ours), flip(theirs)
         self.conflicts.append((sheet, cell, base, ours, theirs))
+
+    # --- rows that moved ---
+
+    def plan_rows(self):
+        """Find sheets where one branch inserted, deleted or moved rows and the
+        other only edited cells. The merge follows the branch that moved rows:
+        the other side's edits land on the rows where their cells now are,
+        with formula references renumbered as Excel would. If only their
+        branch moved rows, the result is built on their version (Excel already
+        moved everything else consistently there) and your edits move onto it."""
+        bs, os_, ts = self.b.sheets(), self.o.sheets(), self.t.sheets()
+        bo, bt = _pair(bs, os_), _pair(bs, ts)
+        omaps, tmaps = {}, {}
+        for bname, _, _ in bs:
+            b = self.bc.get(bname)
+            om = row_map(b, self.oc.get(bo.get(bname))) if bo.get(bname) else None
+            tm = row_map(b, self.tc.get(bt.get(bname))) if bt.get(bname) else None
+            if om and tm:
+                self.notes.append(f"both branches inserted or deleted rows on {bname!r}; merged cell by cell")
+            elif om:
+                omaps[bname] = om
+            elif tm:
+                tmaps[bname] = tm
+        if tmaps and not omaps:
+            self.swapped = True
+            self.o, self.t = self.t, self.o
+            self.oc, self.tc = self.tc, self.oc
+            omaps, tmaps, bo, bt = tmaps, {}, bt, bo
+            self.notes.append("their branch inserted or deleted rows on " + ", ".join(map(repr, omaps))
+                              + "; your edits were moved to match")
+        for bname in tmaps:
+            self.notes.append(f"their branch inserted or deleted rows on {bname!r} and yours did on other "
+                              f"sheets; {bname!r} merged cell by cell")
+        self.maps_b = omaps  # by base sheet name
+        self.maps_t = {bt[n]: mp for n, mp in omaps.items() if bt.get(n)}  # by their sheet names
 
     # --- the merge ---
 
@@ -1552,25 +1717,45 @@ class Merger:
                        for ref in pivot_locations(pkg, part)]
         b = self.bc.get(bname, {}) if bname else {}
         o, t = self.oc.get(oname, {}), self.tc.get(tname, {})
-        edits = {}
+        rows = self.maps_b.get(bname) if bname else None
+        edits, src = {}, {}
         for coord in set(b) | set(t):
-            bv, ov, tv = b.get(coord), o.get(coord), t.get(coord)
-            if same(tv, bv) or same(tv, ov):
+            bv, tv = b.get(coord), t.get(coord)
+            if same(tv, bv):
+                continue
+            where = coord
+            if rows:
+                col, r = coordinate_from_string(coord)
+                if rows(r) is None:
+                    self.conflict(oname, f"{coord} (row deleted)", bv, "row deleted", tv)
+                    continue
+                where = f"{col}{rows(r)}"
+            # Compare as if both sides had the row changes.
+            bv = rewrite_refs(bv, bname, self.maps_b)
+            tv = rewrite_refs(tv, tname, self.maps_t)
+            ov = o.get(where)
+            if same(tv, ov):
                 continue
             if same(ov, bv) and not isinstance(tv, Opaque):
-                edits[coord] = tv
-            elif any(overlaps(coord, ref) for ref in pivot_areas):
+                edits[where], src[where] = tv, coord
+            elif any(overlaps(where, ref) for ref in pivot_areas):
                 self.stale_pivots = True
             else:
-                self.conflict(oname, coord, bv, ov, tv)
+                if self.swapped and not isinstance(tv, Opaque):
+                    edits[where], src[where] = tv, coord  # your value wins a clash, as always
+                self.conflict(oname, where, bv, ov, tv)
         if edits:
-            self.edit_cells(oname, tname, edits)
+            self.edit_cells(oname, tname, edits, src)
         for key in ("drawing", "legacyDrawing", "comments"):
             self.merge_sheet_object(oname, key, bpart, opart, tpart)
         for kind in ("table", "pivotTable"):
             self.merge_sheet_collection(oname, kind, bpart, opart, tpart)
 
-    def edit_cells(self, oname, tname, edits):
+    def edit_cells(self, oname, tname, edits, src=None):
+        """Write edits ({cell: value}) into our sheet. src maps each cell to
+        where it was in their version, if rows moved."""
+        src = src or {}
+        at = lambda coord: src.get(coord, coord)
         part = self.sheet_map()[oname][1]
         root = self.tree(part)
         sd = root.find(m("sheetData"))
@@ -1584,10 +1769,10 @@ class Merger:
         their_styles, base_styles = {}, None
         if self.same_styles:
             tpart = dict((n, p) for n, _, p in self.t.sheets())[tname]
-            their_styles = self.t.scan_sheet(tpart, styles_for=set(edits))[2]
+            their_styles = self.t.scan_sheet(tpart, styles_for={at(c) for c in edits})[2]
             bpart = dict((n, p) for n, _, p in self.b.sheets()).get(self.lineage_o.get(oname))
             if bpart and self.b.styles_bytes() == self.o.styles_bytes():
-                base_styles = self.b.scan_sheet(bpart, styles_for=set(edits))[2]
+                base_styles = self.b.scan_sheet(bpart, styles_for={at(c) for c in edits})[2]
         rows = {}
         last = 0
         for row in sd.findall(m("row")):
@@ -1598,10 +1783,10 @@ class Merger:
             row = self.get_row(sd, rows, rnum)
             row.attrib.pop("spans", None)
             c = self.get_cell(row, coord, column_index_from_string(col))
-            restyled = base_styles is not None and c.get("s") != base_styles.get(coord)
+            restyled = base_styles is not None and c.get("s") != base_styles.get(at(coord))
             self.write_value(c, value)
             if self.same_styles and not restyled:
-                s = their_styles.get(coord)
+                s = their_styles.get(at(coord))
                 c.set("s", s) if s else c.attrib.pop("s", None)
             if value is None and c.get("s") is None and len(c) == 0:
                 row.remove(c)
@@ -1999,8 +2184,9 @@ class Merger:
         o = self._names(self.o, self.lineage_o)
         t = self._names(self.t, self.lineage_t)
         wb = self.tree(self.wb)
+        moved = lambda v, maps: v and (rewrite_refs("=" + v[0], None, maps)[1:] if v[0] else v[0], v[1])
         for key in set(b) | set(t):
-            bv, ov, tv = b.get(key), o.get(key), t.get(key)
+            bv, ov, tv = moved(b.get(key), self.maps_b), o.get(key), moved(t.get(key), self.maps_t)
             if tv == bv or tv == ov:
                 continue
             if ov != bv:
@@ -2394,12 +2580,14 @@ def merge(base_path, ours_path, theirs_path, display_path=None):
     with open(ours_path, "wb") as f:
         f.write(data)
     took = f"{mg.cells_taken} cell(s)" + (f" and {len(mg.objects_taken)} object(s)" if mg.objects_taken else "")
+    if mg.swapped:  # built on their version; the cells written were yours
+        took = "their inserted/deleted rows plus " + took.replace("cell(s)", "of your cell edit(s)", 1)
     if not mg.conflicts:
-        say(f"xlgit merged {name}: took {took} from the other branch, no conflicts.")
+        say(f"xlgit merged {name}: took {took}" + ("" if mg.swapped else " from the other branch") + ", no conflicts.")
     for note in mg.notes:
         say(f"  note: {note}")
     if mg.conflicts:
-        say(f"xlgit merged {name}: took {took} from the other branch, but "
+        say(f"xlgit merged {name}: took {took}" + ("" if mg.swapped else " from the other branch") + ", but "
             f"{len(mg.conflicts)} change(s) clash.")
         for sheet, coord, bv, ov, tv in mg.conflicts[:20]:
             say(f"  {sheet} {coord}: yours {fmt(ov)}, theirs {fmt(tv)} (was {fmt(bv)})")

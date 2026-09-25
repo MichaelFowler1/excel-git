@@ -830,6 +830,295 @@ def sheet_ops(pkg, edits, rng):
     return ops
 
 
+# ---------- rows inserted or deleted on one branch ----------
+#
+# Written independently of xlgit's row handling: a regex finds references,
+# not openpyxl's tokenizer, and the expected result is worked out here.
+
+_REF = re.compile(r"(?<![A-Za-z0-9_.!\]$])((?:'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_.]*)!)?"
+                  r"(\$?[A-Za-z]{1,3}\$?\d+(?::\$?[A-Za-z]{1,3}\$?\d+)?|\$?\d+:\$?\d+)(?![A-Za-z0-9_(\[])")
+_PART = re.compile(r"^(\$?[A-Za-z]{0,3}\$?)(\d+)$")
+
+
+def shift_formula(text, host, sheet, fn, fn_start, fn_end):
+    """Renumber rows in references to `sheet` in a formula written on `host`."""
+    if '"' in text:
+        pieces = text.split('"')  # leave string literals alone
+        return '"'.join(shift_formula(p, host, sheet, fn, fn_start, fn_end) if i % 2 == 0 else p
+                        for i, p in enumerate(pieces))
+
+    def one(mt):
+        prefix, ref = mt.group(1) or "", mt.group(2)
+        target = prefix[:-1] if prefix else host
+        if target.startswith("'"):
+            target = target[1:-1].replace("''", "'")
+        if target != sheet:
+            return mt.group(0)
+        ends = ref.split(":")
+        if len(ends) == 1:
+            p = _PART.match(ends[0])
+            r = fn(int(p.group(2)))
+            return prefix + (f"{p.group(1)}{r}" if r is not None else "#REF!") if r is not None else "#REF!"
+        a, b = _PART.match(ends[0]), _PART.match(ends[1])
+        ra, rb = fn_start(int(a.group(2))), fn_end(int(b.group(2)))
+        if ra is None or rb is None or ra > rb:
+            return "#REF!"
+        return f"{prefix}{a.group(1)}{ra}:{b.group(1)}{rb}"
+    return _REF.sub(one, text)
+
+
+class RowOp:
+    """Insert `count` rows before row `at`, or delete rows at..at+count-1."""
+
+    def __init__(self, kind, at, count):
+        self.kind, self.at, self.count = kind, at, count
+
+    def __call__(self, r):
+        if self.kind == "insert":
+            return r if r < self.at else r + self.count
+        if self.at <= r < self.at + self.count:
+            return None
+        return r if r < self.at else r - self.count
+
+    def start(self, r):
+        return self(r) if self(r) is not None else self.at
+
+    def end(self, r):
+        return self(r) if self(r) is not None else (self.at - 1 if self.at > 1 else None)
+
+
+def row_op_eligible(pkg, name, part):
+    """Sheets simple enough for this file's own row insert: nothing on them
+    that also needs moving (merged cells, tables, drawings, pivots...)."""
+    root = pkg.xml(part)
+    if root is None or etree.QName(root).localname != "worksheet":
+        return False
+    blockers = {"mergeCells", "conditionalFormatting", "dataValidations", "hyperlinks", "tableParts",
+                "drawing", "legacyDrawing", "autoFilter", "rowBreaks", "extLst", "protectedRanges"}
+    if any(etree.QName(c).localname in blockers for c in root if isinstance(c.tag, str)):
+        return False
+    if any(f.get("t") in ("array", "dataTable") for f in root.iter(m("f"))):
+        return False
+    wb = pkg.xml(pkg.workbook)
+    if wb.find(m("pivotCaches")) is not None or wb.find(m("externalReferences")) is not None:
+        return False
+    dn = wb.find(m("definedNames"))
+    if dn is not None and any(name in (d.text or "") for d in dn):
+        return False
+    if any(p.startswith("xl/charts/") and name.encode() in d for p, d in pkg.parts.items()):
+        return False
+    return bool(root.find(m("sheetData")) is not None and len(root.find(m("sheetData"))))
+
+
+def apply_row_op(ed, sheet, part, op):
+    """Do to ed's copy what Excel does: move the cells, and renumber every
+    formula that points at this sheet, on every sheet."""
+    for pname, root_part in [(n, p) for n, _, p in ed.pkg.sheets() if p in ed.pkg.parts]:
+        root = ed.tree(root_part)
+        sd = root.find(m("sheetData"))
+        if sd is None:
+            continue
+        for f in list(root.iter(m("f"))):
+            if f.get("t") == "shared" and (f.text or "").strip():
+                ed.unshare(sd, f.get("si"))
+        for f in root.iter(m("f")):
+            if f.text:
+                f.text = shift_formula(f.text, pname, sheet, op, op.start, op.end)
+    root = ed.tree(part)
+    sd = root.find(m("sheetData"))
+    for n, row in list(iter_rows(sd)):
+        new = op(n)
+        if new is None:
+            sd.remove(row)
+            continue
+        row.set("r", str(new))
+        for ref, c in list(iter_cells(row, n)):
+            c.set("r", f"{coordinate_from_string(ref)[0]}{new}")
+    dim = root.find(m("dimension"))
+    if dim is not None:
+        root.remove(dim)
+    ed.rows.pop(part, None)
+
+
+def run_rows(path, seed, keep=None):
+    """One branch inserts or deletes rows on a sheet; both edit cells."""
+    rng = random.Random(f"rows:{seed}:{os.path.basename(path)}")
+    res = {"file": str(path), "seed": seed, "mode": "rows"}
+    data = Path(path).read_bytes()
+    try:
+        base_problems = structural(data, "input")
+        pkg = xlgit.Package(data)
+        base_vals = sheet_values(pkg)
+    except Exception as e:
+        res.update(status="skip", reason="input unreadable", detail=repr(e)[:200])
+        return res
+    sheets = [(n, p) for n, _, p in pkg.sheets() if p in pkg.parts and row_op_eligible(pkg, n, p)]
+    if not sheets:
+        res.update(status="skip", reason="no sheet simple enough for a row edit")
+        return res
+    sheet, part = rng.choice(sheets)
+    rows_used = sorted({col_row(c)[1] for c in base_vals.get(sheet, {})})
+    if len(rows_used) < 3:
+        res.update(status="skip", reason="sheet too small")
+        return res
+    kind = rng.choice(["insert", "delete"])
+    at = rng.choice(rows_used[1:])
+    op = RowOp(kind, at, rng.randint(1, 3))
+    mover = rng.choice(["ours", "theirs"])
+    S, N = Editor(data), Editor(data)
+    apply_row_op(S, sheet, part, op)
+    if kind == "insert":
+        for r in range(op.at, op.at + op.count):
+            for c in rng.sample(range(1, 6), 2):
+                S.set(part, f"{get_column_letter(c)}{r}", random_value(rng, False), rng=rng)
+    # Both sides edit cells: N in base positions, S in its new positions.
+    base_cells = list(base_vals.get(sheet, {}))
+    n_edits = {c: random_value(rng) for c in rng.sample(base_cells, min(len(base_cells), rng.randint(2, 10)))}
+    s_edits = {}
+    for c in rng.sample(base_cells, min(len(base_cells), rng.randint(0, 5))):
+        col, r = coordinate_from_string(c)
+        if op(r) is not None:
+            s_edits[f"{col}{op(r)}"] = random_value(rng)
+    if n_edits and rng.random() < 0.3:  # sometimes both edit the same cell
+        c = rng.choice(list(n_edits))
+        col, r = coordinate_from_string(c)
+        if op(r) is not None:
+            s_edits[f"{col}{op(r)}"] = random_value(rng)
+    for c, v in n_edits.items():
+        N.set(part, c, v, rng=rng)
+    for c, v in s_edits.items():
+        S.set(part, c, v, rng=rng)
+    sbytes, nbytes = S.save(), N.save()
+    obytes, tbytes = (sbytes, nbytes) if mover == "ours" else (nbytes, sbytes)
+    res.update(op=f"{mover} {kind} {op.count} at {sheet}!{op.at}", edits=len(n_edits) + len(s_edits))
+
+    old_alarm = signal.signal(signal.SIGALRM, _timeout)
+    limit = TIMEOUT + len(data) // 50_000
+    signal.alarm(limit)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            b, o, t = (os.path.join(td, n) for n in ("base.xlsx", "ours.xlsx", "theirs.xlsx"))
+            for p_, blob in ((b, data), (o, obytes), (t, tbytes)):
+                Path(p_).write_bytes(blob)
+            try:
+                mg = xlgit.Merger(b, o, t)
+                merged = mg.run()
+            except Timeout:
+                raise Check("merge timed out", f">{limit}s")
+            except Exception as e:
+                raise Check("merge crashed", _where(e))
+            res["detected"] = verify_rows(data, obytes, tbytes, merged, mg, sheet, op, base_problems)
+        res.update(status="ok", conflicts=len(mg.conflicts))
+    except Timeout:
+        res.update(status="fail", reason="check timed out", detail=f">{limit}s")
+    except Check as e:
+        res.update(status="fail", reason=e.kind, detail=str(e.detail)[:600])
+        if keep:
+            d = Path(keep) / (Path(path).stem + "-rows")
+            d.mkdir(parents=True, exist_ok=True)
+            for n_, blob in (("base", data), ("ours", obytes), ("theirs", tbytes)):
+                (d / f"{n_}.xlsx").write_bytes(blob)
+            if "merged" in locals():
+                (d / "merged.xlsx").write_bytes(merged)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_alarm)
+    return res
+
+
+class _Same:
+    """No rows moved."""
+    def __call__(self, r):
+        return r
+    start = end = __call__
+
+
+class _Follow:
+    """Where base rows went, worked out here from the rows xlgit matched
+    (xlgit's own lookup isn't trusted): a matched row goes where it was
+    matched, a deleted one nowhere, any other row moves with the nearest
+    matched row above it."""
+
+    def __init__(self, matched, deleted):
+        self.matched, self.deleted = dict(matched), set(deleted)
+        self.order = sorted(self.matched)
+
+    def __call__(self, r):
+        if r in self.deleted:
+            return None
+        if r in self.matched:
+            return self.matched[r]
+        above = [b for b in self.order if b < r]
+        return r + (self.matched[above[-1]] - above[-1]) if above else r
+
+    def start(self, r):
+        while r in self.deleted:
+            r += 1
+        return self(r)
+
+    def end(self, r):
+        while r in self.deleted and r > 1:
+            r -= 1
+        return None if r in self.deleted else self(r)
+
+
+def verify_rows(data, obytes, tbytes, merged, mg, sheet, op, known_problems):
+    """Check the merged cells against a 3-way merge worked out here, following
+    the rows xlgit recognised as moved (the true edit can be impossible to
+    recognise, e.g. deleting one of many identical rows). Returns whether
+    xlgit recognised the row change exactly."""
+    worse = new_problems(known_problems, structural(merged, "merged"))
+    if worse:
+        raise Check(f"merged: {worse[0].split(':', 1)[0]}", "; ".join(worse)[:300])
+    mp = mg.maps_b.get(sheet)
+    fn = _Follow(mp.exact, mp.deleted) if mp else _Same()
+    # xlgit builds on the branch whose rows moved; the other side's edits move onto it.
+    startb, otherb = (tbytes, obytes) if mg.swapped else (obytes, tbytes)
+    bv, sv, nv, mv = (sheet_values(xlgit.Package(x)) for x in (data, startb, otherb, merged))
+    rw = lambda v, host: ("f", shift_formula(v[1], host, sheet, fn, fn.start, fn.end)) if mp and v and v[0] == "f" else v
+    want, conflicts = {}, set()
+    for name in sv:
+        if name not in mv:
+            raise Check("sheet lost", name)
+        exp = dict(sv[name])
+        b, n = bv.get(name, {}), nv.get(name, {})
+        moves = name == sheet and mp is not None
+        for c in set(b) | set(n):
+            if same(n.get(c), b.get(c)):
+                continue
+            col, r = coordinate_from_string(c)
+            r2 = fn(r) if moves else r
+            if r2 is None:
+                conflicts.add((name, f"{c} (row deleted)"))
+                continue
+            tgt = f"{col}{r2}"
+            bx, nx, s_now = rw(b.get(c), name), rw(n.get(c), name), sv[name].get(tgt)
+            if same(nx, s_now):
+                continue
+            if same(s_now, bx):
+                exp[tgt] = nx
+            else:
+                conflicts.add((name, tgt))
+                exp[tgt] = nx if mg.swapped else s_now  # your value wins a clash
+            if exp.get(tgt) is None:
+                exp.pop(tgt, None)
+        want[name] = exp
+    got_conflicts = {(s_, c_) for s_, c_, *_ in mg.conflicts if not str(c_).startswith("(")}
+    if got_conflicts - conflicts:
+        raise Check("false conflict", repr(sorted(got_conflicts - conflicts)[:3]))
+    if conflicts - got_conflicts:
+        raise Check("conflict not reported", repr(sorted(conflicts - got_conflicts)[:3]))
+    for name, exp in want.items():
+        got = mv[name]
+        for c in set(exp) | set(got):
+            if not same(exp.get(c), got.get(c)):
+                raise Check("cell wrong after row change", f"{name}!{c} want={exp.get(c)} got={got.get(c)}")
+    if set(mv) - set(sv) - {xlgit.CONFLICT_SHEET}:
+        raise Check("sheet appeared", repr(set(mv) - set(sv)))
+    base_rows = {coordinate_from_string(c)[1] for c in bv.get(sheet, {})}
+    return mp is not None and all(fn(r) == op(r) for r in base_rows)
+
+
 def libreoffice_resave(data):
     """Open and save the workbook in LibreOffice Calc: a different writer,
     which renumbers parts and rewrites strings, styles and formulas."""
@@ -916,8 +1205,10 @@ def _where(e):
 
 
 def _job(args):
-    path, seed, keep, writer = args
+    path, seed, keep, writer, mode = args
     try:
+        if mode == "rows":
+            return run_rows(path, seed, keep)
         return run_one(path, seed, keep, writer)
     except Exception as e:
         return {"file": str(path), "seed": seed, "status": "fail", "reason": "harness error", "detail": _where(e)}
@@ -960,6 +1251,8 @@ def main(argv=None):
     ap.add_argument("--sample", type=int, help="random sample of this many files")
     ap.add_argument("--out", default="fuzz-results.jsonl")
     ap.add_argument("--keep", help="copy base/ours/theirs/merged of failures here")
+    ap.add_argument("--mode", choices=["cells", "rows"], default="cells",
+                    help="cells: random cell and sheet edits; rows: one branch inserts or deletes rows")
     ap.add_argument("--writer", choices=["libreoffice"],
                     help="re-save ours in another app before merging (needs soffice)")
     ap.add_argument("--max-memory", type=float, default=4.0, help="GB per worker (default 4)")
@@ -973,12 +1266,13 @@ def main(argv=None):
     if a.sample:
         files = random.Random(a.seed).sample(files, min(a.sample, len(files)))
     files = files[:a.limit]
-    jobs = [(str(f), a.seed + i, a.keep, a.writer) for f in files for i in range(a.rounds)]
-    stats, sigs = collections.Counter(), collections.defaultdict(list)
+    jobs = [(str(f), a.seed + i, a.keep, a.writer, a.mode) for f in files for i in range(a.rounds)]
+    stats, sigs, done = collections.Counter(), collections.defaultdict(list), []
     with open(a.out, "w") as out, pool_context().Pool(a.jobs, _cap_memory, (a.max_memory,), maxtasksperchild=50) as pool:
         for i, r in enumerate(pool.imap_unordered(_job, jobs, chunksize=4), 1):
             out.write(json.dumps(r) + "\n")
             out.flush()
+            done.append(r)
             stats[r["status"]] += 1
             if r["status"] == "fail":
                 sigs[signature(r)].append(r)
@@ -987,6 +1281,9 @@ def main(argv=None):
             if i % 200 == 0:
                 print(f"{i}/{len(jobs)} {dict((k, v) for k, v in stats.items() if ':' not in k)}", file=sys.stderr)
     print(f"\n{len(jobs)} runs: " + ", ".join(f"{k} {v}" for k, v in sorted(stats.items())))
+    if a.mode == "rows":
+        found = sum(1 for r in done if r.get("detected"))
+        print(f"row change recognised exactly in {found} of {sum(1 for r in done if r['status'] == 'ok')} passing runs")
     for sig, rs in sorted(sigs.items(), key=lambda kv: -len(kv[1])):
         print(f"\n[{len(rs)}] {sig}")
         for r in rs[:3]:
