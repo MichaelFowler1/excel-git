@@ -8,7 +8,8 @@ Git and GitHub treat `.xlsx` as an opaque binary blob. You can commit, fork and 
 
 | | Without xlgit | With xlgit |
 |---|---|---|
-| `git diff` | `Binary files differ` | `-Budget!B2 1000` / `+Budget!B2 1100`, plus chart, image and comment changes |
+| `git diff` | `Binary files differ` | `changed Budget!B2 1000 -> 1100`, plus inserted, deleted and moved rows, and chart, image and comment changes |
+| Seeing changes | n/a | `xlgit diff --html`: the sheet as a grid in your browser, changes highlighted |
 | Merge, different cells edited | conflict, pick one whole file | merges cleanly |
 | Merge, same cell edited | conflict | conflict on just that cell, listed in a `_merge_conflicts` sheet with a link to it |
 | Charts, images, comments, formatting, macros | n/a | kept, and their edits to them carried over |
@@ -38,14 +39,19 @@ Run `xlgit` on its own at any time to see the commands and check that everything
 
 ## Everyday use
 
-**See what changed.** `xlgit diff` lists every cell that changed in your workbooks since the last commit. `git diff`, `git log -p` and `git show` show cell changes too.
+**See what changed.** `xlgit diff` lists every cell that changed in your workbooks since the last commit. Inserted, deleted and moved rows show up as rows, not as every cell below them changing. `git diff`, `git log -p` and `git show` show cell changes too.
 
 ```
 $ xlgit diff
 === budget.xlsx ===
-changed        Budget!B2  1000 -> 1100
-added          Budget!A5  (empty) -> 'Gas'
+changed        Budget!C3  350 -> 999
+row inserted   Budget row 4  A: 'Gas', B: 60, C: 70, D: =B4+C4
+changed        Budget!D8  =SUM(D2:D6) -> =SUM(D2:D7)
 ```
+
+`xlgit diff --html` opens the same changes in your browser, laid out like the spreadsheet:
+
+<img src="docs/visual-diff.png" alt="Visual diff: a changed cell shows its old value, an inserted row is green, a changed SUM range is highlighted" width="480">
 
 **Merge.** `git merge` and `git pull` combine edits from both branches cell by cell. If you changed different cells, there's nothing to do.
 
@@ -85,6 +91,7 @@ xlgit uninstall [--repo]     undo the setup
 xlgit diff                   what changed in your workbooks since the last commit
 xlgit diff FILE              ... in one workbook
 xlgit diff OLD NEW           compare any two workbooks (--markdown for a table)
+xlgit diff --html [FILES]    open the changes in your browser (--out=page.html to save it)
 xlgit --version
 ```
 
@@ -145,7 +152,7 @@ python fuzz/merge_fuzz.py corpus --keep failed/
 - Until Excel refreshes a merged pivot, the numbers in its cells are the old ones. Excel does this on open, but tools that read the file without Excel (pandas, openpyxl) see the stale values.
 - Slicers, timelines and tables linked to external data connections aren't merged. They're reported as conflicts so nothing disappears silently.
 - If both branches added a chart to a sheet that had none, only yours is kept (flagged).
-- Inserting a row shows up as many changed cells, because every cell below it moves. Fixing this is next on the [roadmap](ROADMAP.md).
+- Diffs recognise inserted, deleted and moved rows, but merges don't yet: if both branches changed a sheet and one of them inserted rows, you can get conflicts on cells that only moved. That's next on the [roadmap](ROADMAP.md). Inserted columns show as changed cells for now.
 - `.xls` (the old pre-2007 format) isn't supported. Save as `.xlsx`.
 
 ## Roadmap

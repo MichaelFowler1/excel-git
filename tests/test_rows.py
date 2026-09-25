@@ -67,3 +67,26 @@ def test_empty_row_inserted(tmp_path):
 def test_plain_edits_stay_cell_by_cell(tmp_path):
     got = changes(tmp_path, [("Rent", 1100, 1000)] + BASE[1:])
     assert got == [("changed", "B2", 1000, 1100)]
+
+
+def page(tmp_path, new_rows, **kw):
+    a = budget(tmp_path / "a.xlsx", BASE)
+    b = budget(tmp_path / "b.xlsx", new_rows, **kw)
+    return xlgit.html_report([("budget.xlsx", xlgit.Package.open(a), xlgit.Package.open(b))])
+
+
+def test_visual_diff_marks_rows_and_cells(tmp_path):
+    html = page(tmp_path, BASE[:1] + [("Food", 300, 999), ("Gas", 60, 70)] + BASE[2:])
+    assert '<tr class="ins"><td class="rn" title="inserted">4</td>' in html
+    assert '<span class="was">350</span>999' in html
+    assert "=SUM(D2:D7)" in html and "3 change(s)" in html
+
+
+def test_visual_diff_shows_deleted_and_moved_rows(tmp_path):
+    assert '<tr class="dele"><td class="rn" title="deleted">−3</td>' in page(tmp_path, BASE[:1] + BASE[2:])
+    assert 'title="moved from row 2">5</td>' in page(tmp_path, BASE[1:4] + BASE[:1] + BASE[4:])
+
+
+def test_visual_diff_never_runs_cell_text(tmp_path):
+    html = page(tmp_path, [("<script>alert(1)</script>", 1000, 1000)] + BASE[1:])
+    assert "<script>" not in html and "&lt;script&gt;alert(1)&lt;/script&gt;" in html

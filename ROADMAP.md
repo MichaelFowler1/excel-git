@@ -10,11 +10,11 @@ The items are in rough order. Nothing here has a date. If you want to help with 
 
 ### 1. Test against thousands of real workbooks
 
-Right now the tests use workbooks we built ourselves. The next step is to run the merge driver over public collections of real spreadsheets, such as the Enron corpus and FUSE. Each file gets random edits on two branches, is merged, and the result is checked: it opens, nothing was lost, and every edit from both sides is there. Most of the Enron files are the old `.xls` format, so the `.xlsx` files in these collections do most of the work.
+Done for the first round: `fuzz/merge_fuzz.py` runs the merge over the Enron corpus and the test files of other spreadsheet libraries (about 17,000 workbooks), and found and fixed a dozen bugs before launch. Next: FUSE, and opening merged files in real Excel. The approach: run the merge driver over public collections of real spreadsheets, such as the Enron corpus and FUSE. Each file gets random edits on two branches, is merged, and the result is checked: it opens, nothing was lost, and every edit from both sides is there. Most of the Enron files are the old `.xls` format, so the `.xlsx` files in these collections do most of the work.
 
 ### 2. Understand inserted, deleted and moved rows
 
-Today, inserting a row shows up as hundreds of changed cells, because every cell below it moves. xlgit should recognise inserted, deleted and moved rows and columns, and report them that way. In tables with an ID column, rows should be matched by ID, so two people can add rows to the same table without a conflict, the way a database handles it.
+Diffs now report inserted, deleted and moved rows as rows (on real Enron revisions, a 6,849-line diff became 18 lines). Still to do: merges that follow rows too, so a row one branch inserted doesn't conflict with the other branch's edits below it; inserted columns; and matching table rows by an ID column, so two people can add rows to the same table without a conflict, the way a database handles it.
 
 ## Stage 2: code review for spreadsheets
 

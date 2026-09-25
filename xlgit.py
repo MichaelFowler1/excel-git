@@ -842,25 +842,23 @@ def diff_cells(old, new):
         yield from ((k, sheet, c, a, b) for k, c, a, b in diff_sheet(old.get(sheet, {}), new.get(sheet, {})))
 
 
-def diff_sheet(o, n):
-    """[(kind, coord, old, new)] for one sheet's cells."""
-    plain = [("added" if ov is None else "removed" if nv is None else "changed", coord, ov, nv)
+def diff_sheet(o, n, positions=False):
+    """[(kind, coord, old, new)] for one sheet's cells. With positions, each
+    comes as (row in the new sheet, change); a deleted row sits between rows."""
+    plain = [(coordinate_from_string(coord)[1], ("added" if ov is None else "removed" if nv is None else "changed",
+                                                 coord, ov, nv))
              for coord in sorted(set(o) | set(n), key=_cell_sort_key)
              for ov, nv in [(o.get(coord), n.get(coord))] if not same(ov, nv)]
-    if not plain:
-        return plain
-    aligned = _aligned_diff(_by_row(o), _by_row(n))
-    # Rows only help when they explain the change more simply.
-    if aligned is None or _cost(aligned) >= len(plain):
-        return plain
-    return aligned
+    out = plain
+    if plain:
+        aligned = _aligned_diff(_by_row(o), _by_row(n))
+        # Rows only help when they explain the change more simply.
+        if aligned is not None and len(aligned) < len(plain):
+            out = aligned
+    return out if positions else [c for _, c in out]
 
 
 ROW_EVENTS = ("row inserted", "row deleted", "row moved", "rows inserted", "rows deleted")
-
-
-def _cost(changes):
-    return sum(1 for k, *_ in changes)
 
 
 def _by_row(cells):
@@ -974,7 +972,7 @@ def _aligned_diff(orows, nrows, limit=50000):
         elif blank < 0:
             events.append((n2 - 0.5, 0, ("rows deleted", f"above row {n2}", f"{-blank} empty row(s)", None)))
     events.sort(key=lambda e: (e[0], e[1]))
-    return [e[2] for e in events]
+    return [(e[0], e[2]) for e in events]
 
 
 def diff_objects(old, new):
@@ -1050,6 +1048,216 @@ def diff(old_path, new_path, markdown=False, title=None):
             else:
                 print(f"{kind:14} {sheet}!{coord}  {fmt(ov)} -> {fmt(nv)}")
     return 1 if changes else 0
+
+
+# ---------- visual diff ----------
+
+_CSS = """
+:root{--bg:#fff;--fg:#1f2328;--muted:#656d76;--line:#d0d7de;--head:#f6f8fa;
+--chg:#fff1c2;--chg-b:#d4a72c;--add:#dafbe1;--add-b:#2da44e;--del:#ffebe9;--del-b:#cf222e;--mov:#ddf4ff;--mov-b:#0969da}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8d96a0;--line:#30363d;--head:#161b22;
+--chg:#3b2e0a;--chg-b:#d29922;--add:#0f2e1a;--add-b:#3fb950;--del:#3a1418;--del-b:#f85149;--mov:#0c2d4a;--mov-b:#4493f8}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1400px;margin:0 auto;padding:24px 16px 64px}h1{font-size:20px;margin:0 0 4px}h2{font-size:17px;margin:32px 0 8px}
+h3{font-size:15px;margin:20px 0 8px}.muted{color:var(--muted)}.legend span{display:inline-block;margin-right:14px}
+.sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-1px;margin-right:5px;border:1px solid}
+.wrap{width:fit-content;max-width:100%;overflow-x:auto;border:1px solid var(--line);border-radius:8px}table{border-collapse:collapse;font-size:13px}
+th,td{border:1px solid var(--line);padding:3px 8px;white-space:nowrap;max-width:260px;overflow:hidden;text-overflow:ellipsis}
+th{background:var(--head);color:var(--muted);font-weight:500;position:sticky;top:0}td.rn{background:var(--head);color:var(--muted);text-align:right}
+td.f{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+td.chg{background:var(--chg);box-shadow:inset 0 0 0 1px var(--chg-b)}td.add{background:var(--add);box-shadow:inset 0 0 0 1px var(--add-b)}
+td.rem{background:var(--del);text-decoration:line-through;box-shadow:inset 0 0 0 1px var(--del-b)}
+tr.ins td{background:var(--add)}tr.dele td{background:var(--del);text-decoration:line-through}tr.mov td{background:var(--mov)}
+tr.gap td{background:var(--bg);color:var(--muted);text-align:left;padding-left:48px;font-style:italic;border-left:0;border-right:0}
+.was{display:block;font-size:11px;color:var(--muted);text-decoration:line-through}
+ul.obj{margin:6px 0;padding-left:20px}ul.obj li{margin:2px 0}code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+a{color:var(--mov-b)}nav a{margin-right:12px}
+"""
+
+
+def _cell_html(v):
+    """(text, is_formula) for showing a cell value."""
+    if v is None:
+        return "", False
+    if type(v) is bool:
+        return ("TRUE" if v else "FALSE"), False
+    if isinstance(v, DateNum):
+        return v.display(), False
+    if isinstance(v, float):
+        return f"{v:.15g}", False
+    if isinstance(v, ArrayF):
+        return "{" + v.text + "}", True
+    if isinstance(v, Opaque):
+        return f"<{v.desc}>", False
+    if isinstance(v, str) and not isinstance(v, Text) and v.startswith("="):
+        return v, True
+    return str(v), False
+
+
+def _sheet_html(o, n, context=2, max_rows=1500, max_cols=40):
+    import html as H
+    changes = diff_sheet(o, n, positions=True)
+    if not changes:
+        return "", 0
+    orows, nrows = _by_row(o), _by_row(n)
+    cells, rowcls, deleted, notes = {}, {}, [], []
+    for pos, (kind, coord, ov, nv) in changes:
+        if kind in ("changed", "added", "removed"):
+            col, r = coordinate_from_string(coord)
+            cells[(r, column_index_from_string(col))] = (kind, ov)
+        elif kind == "row inserted":
+            rowcls[int(coord.split()[1])] = ("ins", "inserted")
+        elif kind == "row moved":
+            a, b = coord.split()[1], coord.split()[3]
+            rowcls[int(b)] = ("mov", f"moved from row {a}")
+        elif kind == "row deleted":
+            deleted.append((pos, int(coord.split()[1])))
+        else:
+            notes.append((pos, f"{nv or ov} {'inserted' if kind == 'rows inserted' else 'deleted'} here"))
+    marked = {r for r, _ in cells} | set(rowcls)
+    # Rows around each change, and around where deleted rows used to be.
+    between = {int(p) for p, _ in deleted + notes} | {int(p) + 1 for p, _ in deleted + notes}
+    show = {r + d for r in marked | between for d in range(-context, context + 1)
+            if r + d in nrows or r + d in marked}
+    show = {r for r in show if r >= 1}
+    items = [(r, 1, r) for r in show] + [(p, 0, ("del", r)) for p, r in deleted] + [(p, 0, ("note", t)) for p, t in notes]
+    items.sort(key=lambda x: (x[0], x[1]))
+    truncated = len(items) > max_rows
+    items = items[:max_rows]
+    used = set()
+    for _, _, it in items:
+        row = nrows.get(it) if isinstance(it, int) else orows.get(it[1]) if it[0] == "del" else None
+        used |= set(row or ())
+    used |= {c for _, c in cells}
+    if not used:
+        used = {1}
+    cols = list(range(1, max(used) + 1))
+    if len(cols) > max_cols:  # wide sheet: changed columns and their neighbours
+        keep = {c + d for c in {c for _, c in cells} | {1} for d in (-1, 0, 1)}
+        cols = [c for c in cols if c in keep][:max_cols]
+    out = ['<div class="wrap"><table><thead><tr><th></th>']
+    prev = None
+    for c in cols:
+        if prev is not None and c != prev + 1:
+            out.append('<th>…</th>')
+        out.append(f"<th>{get_column_letter(c)}</th>")
+        prev = c
+    out.append("</tr></thead><tbody>")
+    span = len(cols) + 1 + sum(1 for a, b in zip(cols, cols[1:]) if b != a + 1)
+    last = 0
+    for _, _, it in items:
+        if isinstance(it, int):
+            if it > last + 1:
+                out.append(f'<tr class="gap"><td colspan="{span}">⋯ {it - last - 1} unchanged row(s)</td></tr>')
+            last = it
+            cls, label = rowcls.get(it, ("", ""))
+            row = nrows.get(it, {})
+            out.append(f'<tr class="{cls}"><td class="rn" title="{H.escape(label)}">{it}</td>')
+            prev = None
+            for c in cols:
+                if prev is not None and c != prev + 1:
+                    out.append("<td></td>")
+                prev = c
+                text, is_f = _cell_html(row.get(c))
+                mark = cells.get((it, c))
+                klass = ["f"] if is_f else []
+                was = ""
+                if mark:
+                    kind, ov = mark
+                    klass.append({"changed": "chg", "added": "add", "removed": "rem"}[kind])
+                    if kind == "removed":
+                        text, _ = _cell_html(ov)
+                    elif kind == "changed":
+                        was = f'<span class="was">{H.escape(_cell_html(ov)[0])}</span>'
+                title = f' title="was: {H.escape(_cell_html(mark[1])[0])}"' if mark and mark[0] == "changed" else ""
+                out.append(f'<td class="{" ".join(klass)}"{title}>{was}{H.escape(text)}</td>')
+            out.append("</tr>")
+        elif it[0] == "del":
+            row = orows.get(it[1], {})
+            out.append(f'<tr class="dele"><td class="rn" title="deleted">−{it[1]}</td>')
+            prev = None
+            for c in cols:
+                if prev is not None and c != prev + 1:
+                    out.append("<td></td>")
+                prev = c
+                text, is_f = _cell_html(row.get(c))
+                out.append(f'<td class="{"f" if is_f else ""}">{H.escape(text)}</td>')
+            out.append("</tr>")
+        else:
+            out.append(f'<tr class="gap"><td colspan="{span}">{H.escape(it[1])}</td></tr>')
+    out.append("</tbody></table></div>")
+    if truncated:
+        out.append(f'<p class="muted">Showing the first {max_rows} rows of changes.</p>')
+    return "".join(out), len(changes)
+
+
+def html_report(items, title="Excel changes"):
+    """A self-contained page: items are (name, old Package, new Package)."""
+    import html as H
+    body, nav = [], []
+    for k, (name, old, new) in enumerate(items):
+        renamed = {a: b for a, b in _pair(old.sheets(), new.sheets()).items() if a != b}
+        back = {b: a for a, b in renamed.items()}
+        oc = read_package_cells(old)
+        nc = {back.get(s, s): v for s, v in read_package_cells(new).items()}
+        objs = list(diff_objects(describe_objects(old), {back.get(s, s): v for s, v in describe_objects(new).items()}))
+        order = [back.get(n_, n_) for n_, _, _ in new.sheets()] + [n_ for n_, _, _ in old.sheets() if n_ not in nc]
+        parts, total = [], 0
+        for sheet in dict.fromkeys(order):
+            shown = renamed.get(sheet, sheet)
+            head = H.escape(shown)
+            if sheet in renamed:
+                head += f' <span class="muted">(renamed from {H.escape(sheet)})</span>'
+                total += 1
+            if sheet not in oc and sheet in nc:
+                head += ' <span class="muted">(new sheet)</span>'
+                total += 1
+            if sheet in oc and sheet not in nc:
+                parts.append(f"<h3>{head} <span class=\"muted\">(sheet deleted)</span></h3>")
+                total += 1
+                continue
+            grid, n_ = _sheet_html(oc.get(sheet, {}), nc.get(sheet, {}))
+            sheet_objs = [o_ for o_ in objs if o_[1] == sheet]
+            if not grid and not sheet_objs and sheet not in renamed and sheet in oc:
+                continue
+            total += n_ + len(sheet_objs)
+            parts.append(f"<h3>{head}</h3>{grid}")
+            if sheet_objs:
+                parts.append('<ul class="obj">' + "".join(
+                    f"<li>{H.escape(kind)}: <code>{H.escape(str(nv if nv is not None else ov))}</code>"
+                    + (f' <span class="muted">(was <code>{H.escape(str(ov))}</code>)</span>' if ov is not None and nv is not None else "")
+                    + "</li>" for kind, _, _, ov, nv in sheet_objs) + "</ul>")
+        anchor = f"wb{k}"
+        nav.append(f'<a href="#{anchor}">{H.escape(name)}</a>')
+        body.append(f'<h2 id="{anchor}">{H.escape(name)} <span class="muted">· {total} change(s)</span></h2>')
+        body.append("".join(parts) or '<p class="muted">No cell or object changes (formatting may still differ).</p>')
+    legend = ('<p class="legend muted"><span><i class="sw" style="background:var(--chg);border-color:var(--chg-b)"></i>changed (old value above)</span>'
+              '<span><i class="sw" style="background:var(--add);border-color:var(--add-b)"></i>added / inserted row</span>'
+              '<span><i class="sw" style="background:var(--del);border-color:var(--del-b)"></i>removed / deleted row</span>'
+              '<span><i class="sw" style="background:var(--mov);border-color:var(--mov-b)"></i>moved row</span></p>')
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            f"<title>{H.escape(title)}</title><style>{_CSS}</style></head><body><main>"
+            f"<h1>{H.escape(title)}</h1>{legend}"
+            + (f"<nav>{''.join(nav)}</nav>" if len(nav) > 1 else "")
+            + "".join(body) + f'<p class="muted">Made by xlgit {__version__}.</p></main></body></html>')
+
+
+def write_html(items, out=None, open_it=True, title="Excel changes"):
+    import tempfile
+    import webbrowser
+    page = html_report(items, title)
+    if out is None:
+        fd, out = tempfile.mkstemp(prefix="xlgit-diff-", suffix=".html")
+        os.close(fd)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(page)
+    print(f"Visual diff: {os.path.abspath(out)}")
+    if open_it:
+        try:
+            webbrowser.open("file://" + os.path.abspath(out).replace("\\", "/"))
+        except Exception:
+            pass
+    return out
 
 
 # ---------- merge ----------
@@ -2385,6 +2593,7 @@ Everyday:
   xlgit diff                 what changed in your workbooks since the last commit
   xlgit diff FILE            ... in one workbook
   xlgit diff OLD NEW         compare any two workbooks
+  xlgit diff --html          see the changes as a highlighted grid in your browser
 
 More:
   xlgit install --repo       set up only the current repository
@@ -2424,26 +2633,33 @@ def _diff_blobs(old, new, title, markdown):
             return 0
 
 
-def diff_worktree(paths=()):
-    """Workbooks changed since the last commit (or new and untracked)."""
+def worktree_changes(paths=()):
+    """[(path, bytes at the last commit, bytes now)] for changed workbooks."""
     root = repo_root()
     if not root:
         raise UserError("not inside a git repository. To compare two files: xlgit diff OLD NEW")
+    abspaths = [os.path.abspath(p) for p in paths]
     os.chdir(root)
     has_head = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], capture_output=True).returncode == 0
     if paths:
-        files = [os.path.relpath(os.path.abspath(p), root).replace("\\", "/") for p in paths]
+        files = [os.path.relpath(p, root).replace("\\", "/") for p in abspaths]
     else:
         files = _changed_workbooks("HEAD") if has_head else []
         untracked = git("ls-files", "--others", "--exclude-standard", "-z").decode("utf-8", "replace").split("\0")
         files += [n for n in untracked if n.lower().endswith((".xlsx", ".xlsm")) and n not in files]
-    if not files:
+    return [(f, _git_blob("HEAD", f) if has_head else b"", open(f, "rb").read() if os.path.exists(f) else b"")
+            for f in files]
+
+
+def diff_worktree(paths=()):
+    """Workbooks changed since the last commit (or new and untracked)."""
+    changes = worktree_changes(paths)
+    if not changes:
         print("No workbook changes since the last commit.")
         return 0
     changed = 0
-    for f in files:
-        new = open(f, "rb").read() if os.path.exists(f) else b""
-        changed |= _diff_blobs(_git_blob("HEAD", f) if has_head else b"", new, f, markdown=False)
+    for f, old, new in changes:
+        changed |= _diff_blobs(old, new, f, markdown=False)
     return changed
 
 
@@ -2507,6 +2723,20 @@ def main(argv):
         if len(args) < 3:
             raise UserError("merge needs BASE OURS THEIRS (git passes these itself).")
         return merge(*args[:4])
+    if cmd == "diff" and "--html" in flags:
+        out = next((a.split("=", 1)[1] for a in flags if a.startswith("--out=")), None)
+        if len(args) == 2:
+            for p in args:
+                if not os.path.exists(p):
+                    raise UserError(f"no such file: {p}")
+            items = [(os.path.basename(args[1]), Package.open(args[0]), Package.open(args[1]))]
+        else:
+            items = [(f, Package(old), Package(new)) for f, old, new in worktree_changes(args)]
+            if not items:
+                print("No workbook changes since the last commit.")
+                return 0
+        write_html(items, out, open_it="--no-open" not in flags)
+        return 0
     if cmd == "diff":
         if len(args) == 2:
             title = next((a.split("=", 1)[1] for a in flags if a.startswith("--title=")), None)
