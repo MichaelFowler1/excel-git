@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use xlgit in your work, please cite it as below."
+title: "xlgit: cell-level diff and merge for Excel workbooks in git"
+type: software
+authors:
+  - family-names: Fowler
+    given-names: Michael
+repository-code: "https://github.com/MichaelFowler1/excel-git"
+license: Apache-2.0
+abstract: >-
+  xlgit makes Excel workbooks work like code in git and GitHub. It diffs
+  workbooks cell by cell and merges branches automatically, keeping charts,
+  images, comments, tables, pivot tables and macros intact, and flags only
+  the cells and objects both sides changed.
+keywords:
+  - excel
+  - git
+  - merge
+  - diff
+  - spreadsheets
+  - version control
