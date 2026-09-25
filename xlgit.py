@@ -831,19 +831,155 @@ def textconv(path):
 # ---------- diff ----------
 
 def diff_cells(old, new):
-    """Yield (kind, sheet, coord, old_value, new_value)."""
+    """Yield (kind, sheet, coord, old_value, new_value). Inserted, deleted and
+    moved rows are reported as rows, not as every cell below them changing."""
     for sheet in sorted(set(old) | set(new)):
         if sheet not in old:
             yield ("sheet added", sheet, "", None, None)
         elif sheet not in new:
             yield ("sheet removed", sheet, "", None, None)
             continue
-        o, n = old.get(sheet, {}), new.get(sheet, {})
-        for coord in sorted(set(o) | set(n), key=_cell_sort_key):
-            ov, nv = o.get(coord), n.get(coord)
-            if not same(ov, nv):
-                kind = "added" if ov is None else "removed" if nv is None else "changed"
-                yield (kind, sheet, coord, ov, nv)
+        yield from ((k, sheet, c, a, b) for k, c, a, b in diff_sheet(old.get(sheet, {}), new.get(sheet, {})))
+
+
+def diff_sheet(o, n, positions=False):
+    """[(kind, coord, old, new)] for one sheet's cells. With positions, each
+    comes as (row in the new sheet, change); a deleted row sits between rows."""
+    plain = [(coordinate_from_string(coord)[1], ("added" if ov is None else "removed" if nv is None else "changed",
+                                                 coord, ov, nv))
+             for coord in sorted(set(o) | set(n), key=_cell_sort_key)
+             for ov, nv in [(o.get(coord), n.get(coord))] if not same(ov, nv)]
+    out = plain
+    if plain:
+        aligned = _aligned_diff(_by_row(o), _by_row(n))
+        # Rows only help when they explain the change more simply.
+        if aligned is not None and len(aligned) < len(plain):
+            out = aligned
+    return out if positions else [c for _, c in out]
+
+
+ROW_EVENTS = ("row inserted", "row deleted", "row moved", "rows inserted", "rows deleted")
+
+
+def _by_row(cells):
+    rows = {}
+    for coord, v in cells.items():
+        col, row = coordinate_from_string(coord)
+        rows.setdefault(row, {})[column_index_from_string(col)] = v
+    return rows
+
+
+_ANCHOR = 500000  # a row far from any edge, so shifted references stay valid
+
+
+def _shape(v, row, cache):
+    """The value as it would read from any row: a formula's relative
+    references are rewritten as if its cell sat on row _ANCHOR, so =B6*C6 in
+    row 6 and =B7*C7 in row 7 have the same shape."""
+    if type(v) is bool:
+        return ("b", v)
+    if isinstance(v, (int, float)):
+        return ("n", f"{v:.15g}")
+    if isinstance(v, Text):
+        return ("t", str(v))
+    if isinstance(v, ArrayF) or (isinstance(v, str) and v.startswith("=") and len(v) > 1):
+        text = v.text if isinstance(v, ArrayF) else v
+        key = (text, row)
+        if key not in cache:
+            try:
+                cache[key] = Translator(text, f"A{row}").translate_formula(f"A{_ANCHOR}")
+            except Exception:
+                cache[key] = text
+        return ("f", cache[key])
+    return ("v", v)
+
+
+def _align(orows, nrows, cache):
+    """Line up two sheets' rows by content. Returns sorted row numbers of
+    each side and index lists: pairs (same row), lone_old (deleted),
+    lone_new (inserted), moved (i, j)."""
+    import difflib
+    shape_row = lambda row, r: tuple(sorted((c, _shape(v, r, cache)) for c, v in row.items()))
+    ro, rn = sorted(orows), sorted(nrows)
+    ok = [shape_row(orows[r], r) for r in ro]
+    nk = [shape_row(nrows[r], r) for r in rn]
+    pairs, lone_old, lone_new = [], [], []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ok, nk, autojunk=False).get_opcodes():
+        if tag == "equal" or (tag == "replace" and i2 - i1 == j2 - j1):
+            pairs += zip(range(i1, i2), range(j1, j2))
+            continue
+        # Uneven block: pair rows that still share most of their cells.
+        j = j1
+        for i in range(i1, i2):
+            best = None
+            for jj in range(j, j2):
+                common = len(set(ok[i]) & set(nk[jj]))
+                if common * 2 >= max(len(ok[i]), len(nk[jj]), 1):
+                    best = jj
+                    break
+            if best is None:
+                lone_old.append(i)
+            else:
+                lone_new += range(j, best)
+                pairs.append((i, best))
+                j = best + 1
+        lone_new += range(j, j2)
+    # A deleted row that reappears unchanged elsewhere was moved.
+    moved = []
+    for i in list(lone_old):
+        match = next((j for j in lone_new if nk[j] == ok[i] and ok[i]), None)
+        if match is not None:
+            lone_old.remove(i)
+            lone_new.remove(match)
+            moved.append((i, match))
+    return ro, rn, pairs, lone_old, lone_new, moved
+
+
+def _aligned_diff(orows, nrows, limit=50000):
+    if len(orows) > limit or len(nrows) > limit:
+        return None
+    cache = {}
+    ro, rn, pairs, lone_old, lone_new, moved = _align(orows, nrows, cache)
+    def summary(row, show=6):
+        cols = sorted(row)
+        text = ", ".join(f"{get_column_letter(c)}: {fmt(row[c])}" for c in cols[:show])
+        return text + (f" (+{len(cols) - show} more)" if len(cols) > show else "")
+    events = []  # (new row position, order, change)
+    for i, j in pairs:
+        r_o, r_n = ro[i], rn[j]
+        a, b = orows[r_o], nrows[r_n]
+        for c in sorted(set(a) | set(b)):
+            av, bv = a.get(c), b.get(c)
+            if r_o == r_n:
+                if same(av, bv):
+                    continue
+            elif (av is None) == (bv is None) and (av is None or _shape(av, r_o, cache) == _shape(bv, r_n, cache)):
+                continue
+            kind = "added" if av is None else "removed" if bv is None else "changed"
+            events.append((r_n, c, (kind, f"{get_column_letter(c)}{r_n}", av, bv)))
+    for i in lone_old:
+        # Place a deleted row where it would have been in the new sheet.
+        after = [rn[j] for i2, j in pairs if i2 < i]
+        events.append(((after[-1] if after else 0) + 0.5, 0, ("row deleted", f"row {ro[i]}", summary(orows[ro[i]]), None)))
+    for j in lone_new:
+        events.append((rn[j], 0, ("row inserted", f"row {rn[j]}", None, summary(nrows[rn[j]]))))
+    for i, j in moved:
+        events.append((rn[j], 0, ("row moved", f"row {ro[i]} -> {rn[j]}", summary(orows[ro[i]]), None)))
+    # Empty rows inserted or deleted show up as a jump in the row offset.
+    content_ins = {rn[j] for j in lone_new} | {rn[j] for _, j in moved}
+    content_del = {ro[i] for i in lone_old} | {ro[i] for i, _ in moved}
+    ro0, rn0 = [0] + ro, [0] + rn  # a virtual row 0 lines up the tops
+    anchored = [(0, 0)] + [(i + 1, j + 1) for i, j in pairs]
+    for (i1, j1), (i2, j2) in zip(anchored, anchored[1:]):
+        o1, o2, n1, n2 = ro0[i1], ro0[i2], rn0[j1], rn0[j2]
+        blank = (n2 - n1) - (o2 - o1) - sum(1 for r in content_ins if n1 < r < n2) \
+            + sum(1 for r in content_del if o1 < r < o2)
+        if blank > 0:
+            events.append((n2 - 0.5, 0, ("rows inserted", f"above row {n2}", None, f"{blank} empty row(s)")))
+        elif blank < 0:
+            events.append((n2 - 0.5, 0, ("rows deleted", f"above row {n2}", f"{-blank} empty row(s)", None)))
+    events.sort(key=lambda e: (e[0], e[1]))
+    return [(e[0], e[2]) for e in events]
 
 
 def diff_objects(old, new):
@@ -885,7 +1021,8 @@ def diff(old_path, new_path, markdown=False, title=None):
     changes = [("sheet renamed", a, "", a, b) for a, b in renamed.items()]
     changes += list(diff_cells(read_package_cells(old), as_old(read_package_cells(new))))
     changes += list(diff_objects(describe_objects(old), as_old(describe_objects(new))))
-    changes = [(k, renamed.get(s, s) if k != "sheet renamed" else s, c, o, n, k.startswith(("object", "sheet renamed")))
+    changes = [(k, renamed.get(s, s) if k != "sheet renamed" else s, c, o, n,
+                k.startswith(("object", "sheet renamed")) or k in ROW_EVENTS)
                for k, s, c, o, n in changes]
     show = lambda v, raw: "" if v is None else v if raw else fmt(v)
     if markdown:
@@ -908,6 +1045,8 @@ def diff(old_path, new_path, markdown=False, title=None):
         for kind, sheet, coord, ov, nv, raw in changes:
             if kind == "sheet renamed":
                 print(f"{kind:14} {ov} -> {nv}")
+            elif kind in ROW_EVENTS:
+                print(f"{kind:14} {sheet} {coord}  {nv if nv is not None else ov}")
             elif raw:  # a chart, table, comment...
                 what = f"{ov} -> {nv}" if ov is not None and nv is not None else nv if nv is not None else ov
                 print(f"{kind:14} {sheet}  {what}")
@@ -916,6 +1055,357 @@ def diff(old_path, new_path, markdown=False, title=None):
             else:
                 print(f"{kind:14} {sheet}!{coord}  {fmt(ov)} -> {fmt(nv)}")
     return 1 if changes else 0
+
+
+# ---------- following rows through a merge ----------
+
+class RowMap:
+    """Where each row of the base version ended up on a branch that inserted,
+    deleted or moved rows: r -> new row number, or None if it was deleted."""
+
+    def __init__(self, pairs, deleted):
+        self.exact = dict(pairs)
+        self.deleted = set(deleted)
+        self.anchors = sorted(self.exact.items())
+        self._keys = [b for b, _ in self.anchors]
+
+    def __call__(self, r):
+        if r in self.exact:
+            return self.exact[r]
+        if r in self.deleted:
+            return None
+        # An empty row moves with the row above it.
+        import bisect
+        i = bisect.bisect_right(self._keys, r) - 1
+        if i < 0:
+            return r
+        b, o = self.anchors[i]
+        return r + (o - b)
+
+    def start(self, r):
+        """First surviving row at or after r (a range's top edge)."""
+        for x in range(r, r + 100000):
+            if x not in self.deleted:
+                return self(x)
+        return None
+
+    def end(self, r):
+        """Last surviving row at or before r (a range's bottom edge)."""
+        for x in range(r, max(r - 100000, 0), -1):
+            if x not in self.deleted:
+                return self(x)
+        return None
+
+
+def row_map(base_cells, cells):
+    """A RowMap if this version of a sheet inserted, deleted or moved rows
+    relative to base, else None (only cells changed)."""
+    if not base_cells or not cells or same_cells(base_cells, cells):
+        return None
+    if not any(k in ROW_EVENTS for k, *_ in diff_sheet(base_cells, cells)):
+        return None
+    brows, rows = _by_row(base_cells), _by_row(cells)
+    cache = {}
+    ro, rn, pairs, lone_old, lone_new, moved = _align(brows, rows, cache)
+    # Moved rows count as deleted and inserted: references to them can't be
+    # followed the way Excel would, so edits there conflict instead.
+    deleted = [ro[i] for i in lone_old] + [ro[i] for i, _ in moved]
+    rmap = RowMap([(ro[i], rn[j]) for i, j in pairs], deleted)
+    # The alignment is a guess that reads well in a diff; a merge that follows
+    # a wrong guess moves real data. Only trust it when it lines up clearly
+    # more cells with base than leaving every row where it was. A real insert
+    # shifts everything below it and wins easily; a handful of edits on rows
+    # that look alike (same formulas down a column) can't.
+    gain = _row_matches(brows, rows, rmap, cache) - _row_matches(brows, rows, lambda r: r, cache)
+    if gain <= 0:
+        return None
+    return rmap
+
+
+def _row_matches(brows, rows, where, cache):
+    """How many base cells hold the same thing (formulas by shape) at the row
+    `where` puts them."""
+    n = 0
+    for r, cells in brows.items():
+        to = where(r)
+        target = rows.get(to) if to is not None else None
+        if not target:
+            continue
+        for c, v in cells.items():
+            if c in target and _shape(v, r, cache) == _shape(target[c], to, cache):
+                n += 1
+    return n
+
+
+_REF_CELL = re.compile(r"^(\$?)([A-Za-z]{1,3})(\$?)(\d+)$")
+_REF_ROW = re.compile(r"^(\$?)(\d+)$")
+
+
+def _move_ref(part, fn):
+    for rx, row_group in ((_REF_CELL, 4), (_REF_ROW, 2)):
+        mt = rx.match(part)
+        if mt:
+            r = fn(int(mt.group(row_group)))
+            if r is None:
+                return None
+            groups = list(mt.groups())
+            groups[row_group - 1] = str(r)
+            return "".join(groups)
+    return part  # a whole column, a name: no rows to move
+
+
+def _ref_row(part):
+    mt = _REF_CELL.match(part) or _REF_ROW.match(part)
+    return int(mt.groups()[-1]) if mt else 0
+
+
+def rewrite_refs(formula, host, maps):
+    """Renumber a formula's row references for rows that moved, as Excel does
+    when rows are inserted or deleted. maps: {sheet name: RowMap}; host is
+    the sheet the formula sits on."""
+    if not maps or not isinstance(formula, str) or isinstance(formula, Text) or not formula.startswith("="):
+        return formula
+    try:
+        from openpyxl.formula.tokenizer import Tokenizer
+        tok = Tokenizer(formula)
+    except Exception:
+        return formula
+    changed = False
+    for t in tok.items:
+        if t.type != "OPERAND" or t.subtype != "RANGE":
+            continue
+        prefix, ref = (t.value.rsplit("!", 1) if "!" in t.value else ("", t.value))
+        if "[" in prefix or "[" in ref:
+            continue  # another workbook, or a table reference
+        sheet = prefix[1:-1].replace("''", "'") if prefix.startswith("'") else (prefix or host)
+        m = maps.get(sheet)
+        if m is None:
+            continue
+        parts = ref.split(":")
+        if len(parts) == 1:
+            new = _move_ref(parts[0], m)
+        elif len(parts) == 2:
+            a, b = _move_ref(parts[0], m.start), _move_ref(parts[1], m.end)
+            new = None if a is None or b is None or _ref_row(a) > _ref_row(b) else f"{a}:{b}"
+        else:
+            continue
+        value = (prefix + "!" if prefix else "") + (new if new is not None else "#REF!")
+        if new is None:
+            value = "#REF!"
+        if value != t.value:
+            t.value = value
+            changed = True
+    return tok.render() if changed else formula
+
+
+# ---------- visual diff ----------
+
+_CSS = """
+:root{--bg:#fff;--fg:#1f2328;--muted:#656d76;--line:#d0d7de;--head:#f6f8fa;
+--chg:#fff1c2;--chg-b:#d4a72c;--add:#dafbe1;--add-b:#2da44e;--del:#ffebe9;--del-b:#cf222e;--mov:#ddf4ff;--mov-b:#0969da}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8d96a0;--line:#30363d;--head:#161b22;
+--chg:#3b2e0a;--chg-b:#d29922;--add:#0f2e1a;--add-b:#3fb950;--del:#3a1418;--del-b:#f85149;--mov:#0c2d4a;--mov-b:#4493f8}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1400px;margin:0 auto;padding:24px 16px 64px}h1{font-size:20px;margin:0 0 4px}h2{font-size:17px;margin:32px 0 8px}
+h3{font-size:15px;margin:20px 0 8px}.muted{color:var(--muted)}.legend span{display:inline-block;margin-right:14px}
+.sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-1px;margin-right:5px;border:1px solid}
+.wrap{width:fit-content;max-width:100%;overflow-x:auto;border:1px solid var(--line);border-radius:8px}table{border-collapse:collapse;font-size:13px}
+th,td{border:1px solid var(--line);padding:3px 8px;white-space:nowrap;max-width:260px;overflow:hidden;text-overflow:ellipsis}
+th{background:var(--head);color:var(--muted);font-weight:500;position:sticky;top:0}td.rn{background:var(--head);color:var(--muted);text-align:right}
+td.f{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+td.chg{background:var(--chg);box-shadow:inset 0 0 0 1px var(--chg-b)}td.add{background:var(--add);box-shadow:inset 0 0 0 1px var(--add-b)}
+td.rem{background:var(--del);text-decoration:line-through;box-shadow:inset 0 0 0 1px var(--del-b)}
+tr.ins td{background:var(--add)}tr.dele td{background:var(--del);text-decoration:line-through}tr.mov td{background:var(--mov)}
+tr.gap td{background:var(--bg);color:var(--muted);text-align:left;padding-left:48px;font-style:italic;border-left:0;border-right:0}
+.was{display:block;font-size:11px;color:var(--muted);text-decoration:line-through}
+ul.obj{margin:6px 0;padding-left:20px}ul.obj li{margin:2px 0}code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+a{color:var(--mov-b)}nav a{margin-right:12px}
+"""
+
+
+def _cell_html(v):
+    """(text, is_formula) for showing a cell value."""
+    if v is None:
+        return "", False
+    if type(v) is bool:
+        return ("TRUE" if v else "FALSE"), False
+    if isinstance(v, DateNum):
+        return v.display(), False
+    if isinstance(v, float):
+        return f"{v:.15g}", False
+    if isinstance(v, ArrayF):
+        return "{" + v.text + "}", True
+    if isinstance(v, Opaque):
+        return f"<{v.desc}>", False
+    if isinstance(v, str) and not isinstance(v, Text) and v.startswith("="):
+        return v, True
+    return str(v), False
+
+
+def _sheet_html(o, n, context=2, max_rows=1500, max_cols=40):
+    import html as H
+    changes = diff_sheet(o, n, positions=True)
+    if not changes:
+        return "", 0
+    orows, nrows = _by_row(o), _by_row(n)
+    cells, rowcls, deleted, notes = {}, {}, [], []
+    for pos, (kind, coord, ov, nv) in changes:
+        if kind in ("changed", "added", "removed"):
+            col, r = coordinate_from_string(coord)
+            cells[(r, column_index_from_string(col))] = (kind, ov)
+        elif kind == "row inserted":
+            rowcls[int(coord.split()[1])] = ("ins", "inserted")
+        elif kind == "row moved":
+            a, b = coord.split()[1], coord.split()[3]
+            rowcls[int(b)] = ("mov", f"moved from row {a}")
+        elif kind == "row deleted":
+            deleted.append((pos, int(coord.split()[1])))
+        else:
+            notes.append((pos, f"{nv or ov} {'inserted' if kind == 'rows inserted' else 'deleted'} here"))
+    marked = {r for r, _ in cells} | set(rowcls)
+    # Rows around each change, and around where deleted rows used to be.
+    between = {int(p) for p, _ in deleted + notes} | {int(p) + 1 for p, _ in deleted + notes}
+    show = {r + d for r in marked | between for d in range(-context, context + 1)
+            if r + d in nrows or r + d in marked}
+    show = {r for r in show if r >= 1}
+    items = [(r, 1, r) for r in show] + [(p, 0, ("del", r)) for p, r in deleted] + [(p, 0, ("note", t)) for p, t in notes]
+    items.sort(key=lambda x: (x[0], x[1]))
+    truncated = len(items) > max_rows
+    items = items[:max_rows]
+    used = set()
+    for _, _, it in items:
+        row = nrows.get(it) if isinstance(it, int) else orows.get(it[1]) if it[0] == "del" else None
+        used |= set(row or ())
+    used |= {c for _, c in cells}
+    if not used:
+        used = {1}
+    cols = list(range(1, max(used) + 1))
+    if len(cols) > max_cols:  # wide sheet: changed columns and their neighbours
+        keep = {c + d for c in {c for _, c in cells} | {1} for d in (-1, 0, 1)}
+        cols = [c for c in cols if c in keep][:max_cols]
+    out = ['<div class="wrap"><table><thead><tr><th></th>']
+    prev = None
+    for c in cols:
+        if prev is not None and c != prev + 1:
+            out.append('<th>…</th>')
+        out.append(f"<th>{get_column_letter(c)}</th>")
+        prev = c
+    out.append("</tr></thead><tbody>")
+    span = len(cols) + 1 + sum(1 for a, b in zip(cols, cols[1:]) if b != a + 1)
+    last = 0
+    for _, _, it in items:
+        if isinstance(it, int):
+            if it > last + 1:
+                out.append(f'<tr class="gap"><td colspan="{span}">⋯ {it - last - 1} unchanged row(s)</td></tr>')
+            last = it
+            cls, label = rowcls.get(it, ("", ""))
+            row = nrows.get(it, {})
+            out.append(f'<tr class="{cls}"><td class="rn" title="{H.escape(label)}">{it}</td>')
+            prev = None
+            for c in cols:
+                if prev is not None and c != prev + 1:
+                    out.append("<td></td>")
+                prev = c
+                text, is_f = _cell_html(row.get(c))
+                mark = cells.get((it, c))
+                klass = ["f"] if is_f else []
+                was = ""
+                if mark:
+                    kind, ov = mark
+                    klass.append({"changed": "chg", "added": "add", "removed": "rem"}[kind])
+                    if kind == "removed":
+                        text, _ = _cell_html(ov)
+                    elif kind == "changed":
+                        was = f'<span class="was">{H.escape(_cell_html(ov)[0])}</span>'
+                title = f' title="was: {H.escape(_cell_html(mark[1])[0])}"' if mark and mark[0] == "changed" else ""
+                out.append(f'<td class="{" ".join(klass)}"{title}>{was}{H.escape(text)}</td>')
+            out.append("</tr>")
+        elif it[0] == "del":
+            row = orows.get(it[1], {})
+            out.append(f'<tr class="dele"><td class="rn" title="deleted">−{it[1]}</td>')
+            prev = None
+            for c in cols:
+                if prev is not None and c != prev + 1:
+                    out.append("<td></td>")
+                prev = c
+                text, is_f = _cell_html(row.get(c))
+                out.append(f'<td class="{"f" if is_f else ""}">{H.escape(text)}</td>')
+            out.append("</tr>")
+        else:
+            out.append(f'<tr class="gap"><td colspan="{span}">{H.escape(it[1])}</td></tr>')
+    out.append("</tbody></table></div>")
+    if truncated:
+        out.append(f'<p class="muted">Showing the first {max_rows} rows of changes.</p>')
+    return "".join(out), len(changes)
+
+
+def html_report(items, title="Excel changes"):
+    """A self-contained page: items are (name, old Package, new Package)."""
+    import html as H
+    body, nav = [], []
+    for k, (name, old, new) in enumerate(items):
+        renamed = {a: b for a, b in _pair(old.sheets(), new.sheets()).items() if a != b}
+        back = {b: a for a, b in renamed.items()}
+        oc = read_package_cells(old)
+        nc = {back.get(s, s): v for s, v in read_package_cells(new).items()}
+        objs = list(diff_objects(describe_objects(old), {back.get(s, s): v for s, v in describe_objects(new).items()}))
+        order = [back.get(n_, n_) for n_, _, _ in new.sheets()] + [n_ for n_, _, _ in old.sheets() if n_ not in nc]
+        parts, total = [], 0
+        for sheet in dict.fromkeys(order):
+            shown = renamed.get(sheet, sheet)
+            head = H.escape(shown)
+            if sheet in renamed:
+                head += f' <span class="muted">(renamed from {H.escape(sheet)})</span>'
+                total += 1
+            if sheet not in oc and sheet in nc:
+                head += ' <span class="muted">(new sheet)</span>'
+                total += 1
+            if sheet in oc and sheet not in nc:
+                parts.append(f"<h3>{head} <span class=\"muted\">(sheet deleted)</span></h3>")
+                total += 1
+                continue
+            grid, n_ = _sheet_html(oc.get(sheet, {}), nc.get(sheet, {}))
+            sheet_objs = [o_ for o_ in objs if o_[1] == sheet]
+            if not grid and not sheet_objs and sheet not in renamed and sheet in oc:
+                continue
+            total += n_ + len(sheet_objs)
+            parts.append(f"<h3>{head}</h3>{grid}")
+            if sheet_objs:
+                parts.append('<ul class="obj">' + "".join(
+                    f"<li>{H.escape(kind)}: <code>{H.escape(str(nv if nv is not None else ov))}</code>"
+                    + (f' <span class="muted">(was <code>{H.escape(str(ov))}</code>)</span>' if ov is not None and nv is not None else "")
+                    + "</li>" for kind, _, _, ov, nv in sheet_objs) + "</ul>")
+        anchor = f"wb{k}"
+        nav.append(f'<a href="#{anchor}">{H.escape(name)}</a>')
+        body.append(f'<h2 id="{anchor}">{H.escape(name)} <span class="muted">· {total} change(s)</span></h2>')
+        body.append("".join(parts) or '<p class="muted">No cell or object changes (formatting may still differ).</p>')
+    legend = ('<p class="legend muted"><span><i class="sw" style="background:var(--chg);border-color:var(--chg-b)"></i>changed (old value above)</span>'
+              '<span><i class="sw" style="background:var(--add);border-color:var(--add-b)"></i>added / inserted row</span>'
+              '<span><i class="sw" style="background:var(--del);border-color:var(--del-b)"></i>removed / deleted row</span>'
+              '<span><i class="sw" style="background:var(--mov);border-color:var(--mov-b)"></i>moved row</span></p>')
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            f"<title>{H.escape(title)}</title><style>{_CSS}</style></head><body><main>"
+            f"<h1>{H.escape(title)}</h1>{legend}"
+            + (f"<nav>{''.join(nav)}</nav>" if len(nav) > 1 else "")
+            + "".join(body) + f'<p class="muted">Made by xlgit {__version__}.</p></main></body></html>')
+
+
+def write_html(items, out=None, open_it=True, title="Excel changes"):
+    import tempfile
+    import webbrowser
+    page = html_report(items, title)
+    if out is None:
+        fd, out = tempfile.mkstemp(prefix="xlgit-diff-", suffix=".html")
+        os.close(fd)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(page)
+    print(f"Visual diff: {os.path.abspath(out)}")
+    if open_it:
+        try:
+            webbrowser.open("file://" + os.path.abspath(out).replace("\\", "/"))
+        except Exception:
+            pass
+    return out
 
 
 # ---------- merge ----------
@@ -960,12 +1450,14 @@ class Merger:
     def __init__(self, base_path, ours_path, theirs_path):
         self.b, self.o, self.t = (Package.open(p) for p in (base_path, ours_path, theirs_path))
         self.bc, self.oc, self.tc = (read_package_cells(p) for p in (self.b, self.o, self.t))
+        self.notes = []
+        self.swapped = False
+        self.plan_rows()
         self.res = dict(self.o.parts)
         self.order = list(self.o.order)
         self.trees = {}
         self.imported = {}  # their part name -> part name in the result
         self.conflicts = []
-        self.notes = []
         self.cells_taken = 0
         self.objects_taken = []
         self.stale_pivots = False
@@ -1146,7 +1638,47 @@ class Merger:
         return {s.get("name"): (s, targets.get(s.get(RID))) for s in wb.find(m("sheets"))}
 
     def conflict(self, sheet, cell, base, ours, theirs):
+        if self.swapped:  # the result was built on their layout; report from your side
+            ours, theirs = theirs, ours
+            flip = lambda v: v.replace("kept ours", "kept theirs (it has their row changes)") \
+                if isinstance(v, str) and not isinstance(v, Text) else v
+            ours, theirs = flip(ours), flip(theirs)
         self.conflicts.append((sheet, cell, base, ours, theirs))
+
+    # --- rows that moved ---
+
+    def plan_rows(self):
+        """Find sheets where one branch inserted, deleted or moved rows and the
+        other only edited cells. The merge follows the branch that moved rows:
+        the other side's edits land on the rows where their cells now are,
+        with formula references renumbered as Excel would. If only their
+        branch moved rows, the result is built on their version (Excel already
+        moved everything else consistently there) and your edits move onto it."""
+        bs, os_, ts = self.b.sheets(), self.o.sheets(), self.t.sheets()
+        bo, bt = _pair(bs, os_), _pair(bs, ts)
+        omaps, tmaps = {}, {}
+        for bname, _, _ in bs:
+            b = self.bc.get(bname)
+            om = row_map(b, self.oc.get(bo.get(bname))) if bo.get(bname) else None
+            tm = row_map(b, self.tc.get(bt.get(bname))) if bt.get(bname) else None
+            if om and tm:
+                self.notes.append(f"both branches inserted or deleted rows on {bname!r}; merged cell by cell")
+            elif om:
+                omaps[bname] = om
+            elif tm:
+                tmaps[bname] = tm
+        if tmaps and not omaps:
+            self.swapped = True
+            self.o, self.t = self.t, self.o
+            self.oc, self.tc = self.tc, self.oc
+            omaps, tmaps, bo, bt = tmaps, {}, bt, bo
+            self.notes.append("their branch inserted or deleted rows on " + ", ".join(map(repr, omaps))
+                              + "; your edits moved to the rows where those cells are now")
+        for bname in tmaps:
+            self.notes.append(f"their branch inserted or deleted rows on {bname!r} and yours did on other "
+                              f"sheets; {bname!r} merged cell by cell")
+        self.maps_b = omaps  # by base sheet name
+        self.maps_t = {bt[n]: mp for n, mp in omaps.items() if bt.get(n)}  # by their sheet names
 
     # --- the merge ---
 
@@ -1210,25 +1742,45 @@ class Merger:
                        for ref in pivot_locations(pkg, part)]
         b = self.bc.get(bname, {}) if bname else {}
         o, t = self.oc.get(oname, {}), self.tc.get(tname, {})
-        edits = {}
+        rows = self.maps_b.get(bname) if bname else None
+        edits, src = {}, {}
         for coord in set(b) | set(t):
-            bv, ov, tv = b.get(coord), o.get(coord), t.get(coord)
-            if same(tv, bv) or same(tv, ov):
+            bv, tv = b.get(coord), t.get(coord)
+            if same(tv, bv):
+                continue
+            where = coord
+            if rows:
+                col, r = coordinate_from_string(coord)
+                if rows(r) is None:
+                    self.conflict(oname, f"{coord} (row deleted)", bv, "row deleted", tv)
+                    continue
+                where = f"{col}{rows(r)}"
+            # Compare as if both sides had the row changes.
+            bv = rewrite_refs(bv, bname, self.maps_b)
+            tv = rewrite_refs(tv, tname, self.maps_t)
+            ov = o.get(where)
+            if same(tv, ov):
                 continue
             if same(ov, bv) and not isinstance(tv, Opaque):
-                edits[coord] = tv
-            elif any(overlaps(coord, ref) for ref in pivot_areas):
+                edits[where], src[where] = tv, coord
+            elif any(overlaps(where, ref) for ref in pivot_areas):
                 self.stale_pivots = True
             else:
-                self.conflict(oname, coord, bv, ov, tv)
+                if self.swapped and not isinstance(tv, Opaque):
+                    edits[where], src[where] = tv, coord  # your value wins a clash, as always
+                self.conflict(oname, where, bv, ov, tv)
         if edits:
-            self.edit_cells(oname, tname, edits)
+            self.edit_cells(oname, tname, edits, src)
         for key in ("drawing", "legacyDrawing", "comments"):
             self.merge_sheet_object(oname, key, bpart, opart, tpart)
         for kind in ("table", "pivotTable"):
             self.merge_sheet_collection(oname, kind, bpart, opart, tpart)
 
-    def edit_cells(self, oname, tname, edits):
+    def edit_cells(self, oname, tname, edits, src=None):
+        """Write edits ({cell: value}) into our sheet. src maps each cell to
+        where it was in their version, if rows moved."""
+        src = src or {}
+        at = lambda coord: src.get(coord, coord)
         part = self.sheet_map()[oname][1]
         root = self.tree(part)
         sd = root.find(m("sheetData"))
@@ -1242,10 +1794,10 @@ class Merger:
         their_styles, base_styles = {}, None
         if self.same_styles:
             tpart = dict((n, p) for n, _, p in self.t.sheets())[tname]
-            their_styles = self.t.scan_sheet(tpart, styles_for=set(edits))[2]
+            their_styles = self.t.scan_sheet(tpart, styles_for={at(c) for c in edits})[2]
             bpart = dict((n, p) for n, _, p in self.b.sheets()).get(self.lineage_o.get(oname))
             if bpart and self.b.styles_bytes() == self.o.styles_bytes():
-                base_styles = self.b.scan_sheet(bpart, styles_for=set(edits))[2]
+                base_styles = self.b.scan_sheet(bpart, styles_for={at(c) for c in edits})[2]
         rows = {}
         last = 0
         for row in sd.findall(m("row")):
@@ -1256,10 +1808,10 @@ class Merger:
             row = self.get_row(sd, rows, rnum)
             row.attrib.pop("spans", None)
             c = self.get_cell(row, coord, column_index_from_string(col))
-            restyled = base_styles is not None and c.get("s") != base_styles.get(coord)
+            restyled = base_styles is not None and c.get("s") != base_styles.get(at(coord))
             self.write_value(c, value)
             if self.same_styles and not restyled:
-                s = their_styles.get(coord)
+                s = their_styles.get(at(coord))
                 c.set("s", s) if s else c.attrib.pop("s", None)
             if value is None and c.get("s") is None and len(c) == 0:
                 row.remove(c)
@@ -1657,8 +2209,9 @@ class Merger:
         o = self._names(self.o, self.lineage_o)
         t = self._names(self.t, self.lineage_t)
         wb = self.tree(self.wb)
+        moved = lambda v, maps: v and (rewrite_refs("=" + v[0], None, maps)[1:] if v[0] else v[0], v[1])
         for key in set(b) | set(t):
-            bv, ov, tv = b.get(key), o.get(key), t.get(key)
+            bv, ov, tv = moved(b.get(key), self.maps_b), o.get(key), moved(t.get(key), self.maps_t)
             if tv == bv or tv == ov:
                 continue
             if ov != bv:
@@ -2047,17 +2600,22 @@ def merge(base_path, ours_path, theirs_path, display_path=None):
             f"  Your version is kept, unchanged. To take theirs instead:\n"
             f"    git checkout --theirs -- \"{name}\"\n"
             f"  Then: git add \"{name}\"  and  git commit\n"
-            f"  Please report this at {ISSUES} so it can be fixed.")
+            f"  Please report this at {ISSUES} so it can be fixed. To share the files safely:\n"
+            f"    xlgit scrub --merge \"{name}\"")
         return 1
     with open(ours_path, "wb") as f:
         f.write(data)
     took = f"{mg.cells_taken} cell(s)" + (f" and {len(mg.objects_taken)} object(s)" if mg.objects_taken else "")
+    if mg.swapped:  # built on their version; the cells written were yours
+        took = took.replace("cell(s)", "of your edited cell(s)", 1) + " onto their inserted/deleted rows"
     if not mg.conflicts:
-        say(f"xlgit merged {name}: took {took} from the other branch, no conflicts.")
+        say(f"xlgit merged {name}: " + (f"moved {took}" if mg.swapped else f"took {took} from the other branch")
+            + ", no conflicts.")
     for note in mg.notes:
         say(f"  note: {note}")
     if mg.conflicts:
-        say(f"xlgit merged {name}: took {took} from the other branch, but "
+        say(f"xlgit merged {name}: " + (f"moved {took}" if mg.swapped else f"took {took} from the other branch")
+            + ", but "
             f"{len(mg.conflicts)} change(s) clash.")
         for sheet, coord, bv, ov, tv in mg.conflicts[:20]:
             say(f"  {sheet} {coord}: yours {fmt(ov)}, theirs {fmt(tv)} (was {fmt(bv)})")
@@ -2080,6 +2638,310 @@ def _reason(e):
     if isinstance(e, etree.XMLSyntaxError):
         return f"the workbook is damaged: {e}"
     return f"{type(e).__name__}: {e}"
+
+
+# ---------- scrub: shareable copies for bug reports ----------
+
+_TINY = {  # 1x1 images that stand in for the originals
+    "png": bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+                         "1f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082"),
+    "gif": bytes.fromhex("47494638396101000100800000ffffff00000021f90401000000002c00000000010001000002024401003b"),
+    "jpeg": bytes.fromhex("ffd8ffe000104a46494600010100000100010000ffdb004300080606070605080707070909080a0c140d0c0b0b0c"
+                          "1912130f141d1a1f1e1d1a1c1c20242e2720222c231c1c2837292c30313434341f27393d38323c2e333432ffc000"
+                          "0b080001000101011100ffc4001f0000010501010101010100000000000000000102030405060708090a0bffc400"
+                          "b5100002010303020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c1"
+                          "1552d1f02433627282090a161718191a25262728292a3435363738393a434445464748494a535455565758595a"
+                          "636465666768696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5"
+                          "b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffda00"
+                          "080101000003f00fbfffd9"),
+}
+_NUM = re.compile(r"^(-?)(\d+)(?:\.(\d+))?([eE][-+]?\d+)?$")
+C_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+
+
+class Scrubber:
+    """Replaces every piece of text and every number in workbooks with made-up
+    ones, keeping their structure, so a workbook that trips xlgit up can be
+    shared in a bug report. Equal values stay equal (across all the files
+    scrubbed together), so a merge of scrubbed versions behaves the same."""
+
+    def __init__(self, key=None):
+        self.key = key or os.urandom(16)
+        self.kept = set()
+
+    def _rng(self, kind, value):
+        import hmac
+        import random
+        return random.Random(hmac.new(self.key, f"{kind}\0{value}".encode(), "sha256").digest())
+
+    def text(self, s):
+        if not s or s in ERRORS or s.upper() in ("TRUE", "FALSE"):
+            return s
+        rng = self._rng("t", s)
+        lower, upper = "abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        return "".join(rng.choice(lower) if ch.islower() else rng.choice(upper) if ch.isupper()
+                       else rng.choice("0123456789") if ch.isdigit()
+                       else rng.choice(lower) if ch.isalpha() else ch for ch in s)
+
+    def number(self, text, date=False):
+        try:
+            value = float(text)
+        except (TypeError, ValueError):
+            return text
+        if value == 0 or value != value:
+            return text
+        # Numbers xlgit treats as equal (to 15 digits) get the same stand-in.
+        text = f"{value:.15g}"
+        mt = _NUM.match(text)
+        if not mt:
+            return text
+        sign, whole, frac, exp = mt.groups()
+        rng = self._rng("n", text)
+        if date:  # somewhere in 1998-2028, keeping any time of day
+            whole = str(rng.randint(36000, 47000))
+        else:
+            whole = "".join(rng.choice("123456789" if i == 0 and len(whole) > 1 else "0123456789")
+                            for i in range(len(whole)))
+        frac = "".join(rng.choice("0123456789") for _ in frac or "")
+        if frac and not frac.strip("0"):
+            frac = frac[:-1] + "5"
+        return f"{sign}{whole}{'.' + frac if frac else ''}{exp or ''}"
+
+    def formula(self, f):
+        """Text inside quotes in a formula is data too."""
+        if '"' not in f:
+            return f
+        try:
+            from openpyxl.formula.tokenizer import Tokenizer
+            tok = Tokenizer("=" + f)
+        except Exception:
+            return re.sub(r'"((?:[^"]|"")*)"', lambda mt: '"' + self.text(mt.group(1).replace('""', '"'))
+                          .replace('"', '""') + '"', f)
+        for t in tok.items:
+            if t.type == "OPERAND" and t.subtype == "TEXT":
+                inner = t.value[1:-1].replace('""', '"')
+                t.value = '"' + self.text(inner).replace('"', '""') + '"'
+        return tok.render()[1:]
+
+    def _texts(self, root, tags):
+        for el in root.iter(*tags):
+            if el.text:
+                el.text = self.text(el.text)
+
+    def scrub(self, data):
+        pkg = Package(data)
+        dates = _date_styles(pkg)
+        out, dropped = {}, set()
+        for name in pkg.order:
+            part = pkg.parts[name]
+            lower = name.lower()
+            ext = lower.rsplit(".", 1)[-1]
+            if lower.endswith("vbaproject.bin") or lower.endswith("vbadata.xml"):
+                dropped.add(name)
+                self.kept.add("macros removed")
+                continue
+            if lower.startswith("xl/media/") or "/media/" in lower:
+                if ext in ("png", "gif") or ext in ("jpg", "jpeg"):
+                    out[name] = _TINY["jpeg" if ext in ("jpg", "jpeg") else ext]
+                else:
+                    out[name] = part
+                    self.kept.add(f"images in .{ext} format kept as they are")
+                continue
+            if not lower.endswith((".xml", ".rels", ".vml")):
+                out[name] = part
+                continue
+            try:
+                root = parse_xml(part)
+            except etree.XMLSyntaxError:
+                out[name] = part
+                continue
+            self._scrub_part(name, root, pkg, dates)
+            out[name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        if dropped:
+            self._unlink(out, dropped)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for name in pkg.order:
+                if name in out:
+                    z.writestr(name, out[name])
+        return buf.getvalue()
+
+    def _unlink(self, out, dropped):
+        for name in list(out):
+            if name.endswith(".rels"):
+                root = parse_xml(out[name])
+                owner = name.replace("_rels/", "")[:-5]
+                owner = "" if owner == "." else owner
+                for r in list(root):
+                    if r.get("TargetMode") != "External" and resolve(owner, r.get("Target")) in dropped:
+                        root.remove(r)
+                out[name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        ct = parse_xml(out["[Content_Types].xml"])
+        for o in list(ct):
+            if (o.get("PartName") or "").lstrip("/") in dropped:
+                ct.remove(o)
+        out["[Content_Types].xml"] = etree.tostring(ct, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    def _scrub_part(self, name, root, pkg, dates):
+        tag = local(root)
+        if name.endswith(".rels"):
+            for r in root:
+                if r.get("TargetMode") == "External":
+                    r.set("Target", "https://example.com/" if "hyperlink" in (r.get("Type") or "")
+                          else "external.xlsx")
+            return
+        if tag in ("worksheet", "macrosheet", "externalLink", "dialogsheet"):
+            self._scrub_cells(root, dates)
+            self._texts(root, (m("oddHeader"), m("oddFooter"), m("evenHeader"), m("evenFooter"),
+                               m("firstHeader"), m("firstFooter")))
+            for el in root.iter(m("hyperlink")):
+                for a in ("display", "tooltip"):
+                    if el.get(a):
+                        el.set(a, self.text(el.get(a)))
+            return
+        if tag == "sst":
+            for si in root.iter(m("si")):
+                for rph in list(si.iter(m("rPh"))):
+                    rph.getparent().remove(rph)
+                self._texts(si, (m("t"),))
+            return
+        if tag == "table":
+            for col in root.iter(m("tableColumn")):
+                col.set("name", xencode(self.text(xdecode(col.get("name")))))
+                for a in ("totalsRowLabel",):
+                    if col.get(a):
+                        col.set(a, self.text(col.get(a)))
+            for f in root.iter(m("calculatedColumnFormula"), m("totalsRowFormula")):
+                if f.text:
+                    f.text = self.formula(f.text)
+            return
+        if tag == "pivotCacheDefinition":
+            for cf in root.iter(m("cacheField")):
+                cf.set("name", self.text(cf.get("name")))
+            self._scrub_items(root)
+            return
+        if tag == "pivotCacheRecords":
+            self._scrub_items(root)
+            return
+        if tag == "pivotTableDefinition":
+            for el in root.iter(m("item"), m("pivotField"), m("dataField")):
+                if el.get("n"):
+                    el.set("n", self.text(el.get("n")))
+                if local(el) == "dataField" and el.get("name"):
+                    el.set("name", self.text(el.get("name")))
+            return
+        if tag in ("comments", "ThreadedComments", "personList", "chartSpace", "wsDr", "userShapes"):
+            for el in root.iter():
+                if not isinstance(el.tag, str):
+                    continue
+                ln = local(el)
+                if ln in ("t", "text") and el.text:
+                    el.text = self.text(el.text)
+                elif ln == "v" and el.text and el.getparent() is not None and local(el.getparent()) == "pt":
+                    cache = el.getparent().getparent()
+                    el.text = self.number(el.text) if cache is not None and local(cache) == "numCache" \
+                        else self.text(el.text)
+                if el.get("displayName") and ln == "person":
+                    el.set("displayName", self.text(el.get("displayName")))
+                if el.get("authorId") is None and ln == "author" and el.text:
+                    el.text = self.text(el.text)
+            return
+        if tag in ("coreProperties", "Properties"):
+            for el in root.iter():
+                if isinstance(el.tag, str) and local(el) in (
+                        "creator", "lastModifiedBy", "title", "subject", "description", "keywords",
+                        "category", "Company", "Manager", "HyperlinkBase", "Template"):
+                    el.text = ""
+            return
+        if "vml" in name.lower():
+            for el in root.iter():
+                if isinstance(el.tag, str) and el.text and el.text.strip() and len(el) == 0 \
+                        and local(el) not in ("Anchor", "Row", "Column", "ClientData"):
+                    el.text = self.text(el.text)
+            return
+
+    def _scrub_items(self, root):
+        for el in root.iter(m("s"), m("n"), m("d"), m("e")):
+            v = el.get("v")
+            if v is None:
+                continue
+            if local(el) == "s":
+                el.set("v", self.text(v))
+            elif local(el) == "n":
+                el.set("v", self.number(v))
+        for el in root.iter(m("sharedItems")):
+            for a in ("minValue", "maxValue"):
+                if el.get(a):
+                    del el.attrib[a]
+
+    def _scrub_cells(self, root, dates):
+        for c in root.iter(m("c")):
+            t = c.get("t")
+            f = c.find(m("f"))
+            v = c.find(m("v"))
+            if f is not None:
+                if f.text:
+                    f.text = self.formula(f.text)
+                if v is not None:  # a cached result: Excel recalculates it on open
+                    c.remove(v)
+                if t in ("str", "s", "e", "b"):
+                    c.attrib.pop("t", None)
+                continue
+            if t == "inlineStr":
+                is_ = c.find(m("is"))
+                if is_ is not None:
+                    self._texts(is_, (m("t"),))
+            elif t == "str" and v is not None and v.text:
+                v.text = self.text(v.text)
+            elif t in (None, "n") and v is not None and v.text:
+                v.text = self.number(v.text, date=c.get("s") in dates)
+
+
+def scrub_files(paths, merge_of=None):
+    """Write NAME.scrubbed.xlsx next to each file, all with one mapping."""
+    sc = Scrubber()
+    written = []
+    for p in paths:
+        with open(p, "rb") as f:
+            data = f.read()
+        stem, ext = os.path.splitext(p)
+        out = f"{stem}.scrubbed{ext or '.xlsx'}"
+        with open(out, "wb") as f:
+            f.write(sc.scrub(data))
+        written.append(out)
+    return written, sc
+
+
+def scrub_merge(path):
+    """During a merge with a conflict on PATH: scrub the three versions git
+    keeps (base, yours, theirs) into one zip for a bug report."""
+    root = repo_root()
+    if not root:
+        raise UserError("run this inside the repository where the merge happened.")
+    rel = os.path.relpath(os.path.abspath(path), root).replace("\\", "/")
+    blobs = {}
+    for stage, label in ((1, "base"), (2, "ours"), (3, "theirs")):
+        r = subprocess.run(["git", "show", f":{stage}:{rel}"], cwd=root, capture_output=True)
+        if r.returncode:
+            raise UserError(f"git has no {label} version of {rel}; is a merge of it in progress? "
+                            "(To scrub files directly: xlgit scrub FILE...)")
+        blobs[label] = r.stdout
+    sc = Scrubber()
+    stem = os.path.splitext(os.path.basename(rel))[0]
+    out = os.path.abspath(f"{stem}-merge-report.zip")
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for label, data in blobs.items():
+            z.writestr(f"{label}.xlsx", sc.scrub(data))
+        z.writestr("README.txt", f"xlgit {__version__} merge report for {stem}: base, ours and theirs, scrubbed.\n")
+    return out, sc
+
+
+def _scrub_notice(sc):
+    kept = "; ".join(sorted(sc.kept))
+    return ("  Every cell value, text box, comment, chart label and file property was replaced with made-up\n"
+            "  values (equal values stay equal). Kept as they were: sheet names, named ranges, formulas\n"
+            "  (text in quotes replaced), formatting and layout" + (f"; {kept}" if kept else "") + ".\n"
+            "  Open it and check before you share it.")
 
 
 # ---------- setup ----------
@@ -2155,15 +3017,19 @@ def _remove_lines(path, lines):
 
 
 def install(scope="global"):
-    here = os.path.abspath(__file__).replace("\\", "/")
-    py = sys.executable.replace("\\", "/")
-    cmd = f'"{py}" "{here}"'
+    if getattr(sys, "frozen", False):  # the standalone download: git runs the program itself
+        cmd = '"' + sys.executable.replace("\\", "/") + '"'
+    else:
+        here = os.path.abspath(__file__).replace("\\", "/")
+        py = sys.executable.replace("\\", "/")
+        cmd = f'"{py}" "{here}"'
     where = ["--global"] if scope == "global" else []
     root = repo_root()
     if scope == "repo" and not root:
         raise UserError("this folder isn't inside a git repository. Run it inside one, "
                         "or run `xlgit install` to set up every repository on this computer.")
     for key, value in (("diff.xlsx.textconv", f"{cmd} textconv"), ("diff.xlsx.binary", "true"),
+                       ("diff.xlsx.command", f"{cmd} gitdiff"),
                        ("merge.xlsx.name", "xlgit cell-level merge"),
                        ("merge.xlsx.driver", f"{cmd} merge %O %A %B %P")):
         git("config", *where, key, value)
@@ -2250,6 +3116,11 @@ Everyday:
   xlgit diff                 what changed in your workbooks since the last commit
   xlgit diff FILE            ... in one workbook
   xlgit diff OLD NEW         compare any two workbooks
+  xlgit diff --html          see the changes as a highlighted grid in your browser
+
+Reporting a problem:
+  xlgit scrub FILE...        a copy with every value made up, safe to attach to a bug report
+  xlgit scrub --merge FILE   the three versions of a merge that went wrong, scrubbed, in one zip
 
 More:
   xlgit install --repo       set up only the current repository
@@ -2289,26 +3160,33 @@ def _diff_blobs(old, new, title, markdown):
             return 0
 
 
-def diff_worktree(paths=()):
-    """Workbooks changed since the last commit (or new and untracked)."""
+def worktree_changes(paths=()):
+    """[(path, bytes at the last commit, bytes now)] for changed workbooks."""
     root = repo_root()
     if not root:
         raise UserError("not inside a git repository. To compare two files: xlgit diff OLD NEW")
+    abspaths = [os.path.abspath(p) for p in paths]
     os.chdir(root)
     has_head = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], capture_output=True).returncode == 0
     if paths:
-        files = [os.path.relpath(os.path.abspath(p), root).replace("\\", "/") for p in paths]
+        files = [os.path.relpath(p, root).replace("\\", "/") for p in abspaths]
     else:
         files = _changed_workbooks("HEAD") if has_head else []
         untracked = git("ls-files", "--others", "--exclude-standard", "-z").decode("utf-8", "replace").split("\0")
         files += [n for n in untracked if n.lower().endswith((".xlsx", ".xlsm")) and n not in files]
-    if not files:
+    return [(f, _git_blob("HEAD", f) if has_head else b"", open(f, "rb").read() if os.path.exists(f) else b"")
+            for f in files]
+
+
+def diff_worktree(paths=()):
+    """Workbooks changed since the last commit (or new and untracked)."""
+    changes = worktree_changes(paths)
+    if not changes:
         print("No workbook changes since the last commit.")
         return 0
     changed = 0
-    for f in files:
-        new = open(f, "rb").read() if os.path.exists(f) else b""
-        changed |= _diff_blobs(_git_blob("HEAD", f) if has_head else b"", new, f, markdown=False)
+    for f, old, new in changes:
+        changed |= _diff_blobs(old, new, f, markdown=False)
     return changed
 
 
@@ -2345,8 +3223,15 @@ def main(argv):
         return 0
     if cmd is None or cmd == "help" or "--help" in flags or "-h" in args:
         print(HELP)
-        for line in status_lines():
+        status = status_lines()
+        for line in status:
             print(line)
+        # Opened by double-clicking the standalone download: offer to set up.
+        if cmd is None and getattr(sys, "frozen", False) and sys.stdin and sys.stdin.isatty():
+            if status and not status[0].startswith("[ok]"):
+                if input("\nSet up xlgit for git on this computer now? [Y/n] ").strip().lower() in ("", "y", "yes"):
+                    install("global")
+            input("\nPress Enter to close.")
         return 0
     if cmd == "textconv":
         # git diff and git log -p call this; never fail them over one bad file.
@@ -2355,10 +3240,37 @@ def main(argv):
         except Exception as e:
             print(f"(xlgit couldn't read this file: {_reason(e)})")
         return 0
+    if cmd == "gitdiff":
+        # git diff runs this with: path old-file old-hex old-mode new-file new-hex new-mode
+        if len(args) < 7:
+            print(f"* Unmerged path {args[0] if args else ''}")
+            return 0
+        path, old, new = args[0], args[1], args[4]
+        print(f"=== {path} ===")
+        try:
+            diff(old if old != "/dev/null" else "", new if new != "/dev/null" else "")
+        except Exception as e:
+            print(f"(xlgit couldn't compare this file: {_reason(e)})")
+        sys.stdout.flush()
+        return 0
     if cmd == "merge":
         if len(args) < 3:
             raise UserError("merge needs BASE OURS THEIRS (git passes these itself).")
         return merge(*args[:4])
+    if cmd == "diff" and "--html" in flags:
+        out = next((a.split("=", 1)[1] for a in flags if a.startswith("--out=")), None)
+        if len(args) == 2:
+            for p in args:
+                if not os.path.exists(p):
+                    raise UserError(f"no such file: {p}")
+            items = [(os.path.basename(args[1]), Package.open(args[0]), Package.open(args[1]))]
+        else:
+            items = [(f, Package(old), Package(new)) for f, old, new in worktree_changes(args)]
+            if not items:
+                print("No workbook changes since the last commit.")
+                return 0
+        write_html(items, out, open_it="--no-open" not in flags)
+        return 0
     if cmd == "diff":
         if len(args) == 2:
             title = next((a.split("=", 1)[1] for a in flags if a.startswith("--title=")), None)
@@ -2384,6 +3296,24 @@ def main(argv):
     if cmd == "uninstall":
         uninstall("repo" if "--repo" in flags else "global")
         return 0
+    if cmd == "scrub":
+        if "--merge" in flags:
+            if len(args) != 1:
+                raise UserError("usage: xlgit scrub --merge FILE   (while a merge of FILE has a conflict)")
+            out, sc = scrub_merge(args[0])
+            print(f"Wrote {out} (base, yours and theirs, scrubbed).")
+            print(_scrub_notice(sc))
+            return 0
+        if not args:
+            raise UserError("usage: xlgit scrub FILE [FILE...]   or   xlgit scrub --merge FILE")
+        for p in args:
+            if not os.path.exists(p):
+                raise UserError(f"no such file: {p}")
+        written, sc = scrub_files(args)
+        for w in written:
+            print(f"Wrote {w}")
+        print(_scrub_notice(sc))
+        return 0
     if cmd == "status":
         for line in status_lines():
             print(line)
@@ -2391,8 +3321,23 @@ def main(argv):
     raise UserError(f"unknown command {cmd!r}. Run `xlgit` to see what it can do.")
 
 
+def _utf8_output():
+    """Cells can hold any language or symbol. Output going to git or a file
+    is UTF-8, which git expects; a console that can't show a character (the
+    Windows default) gets a stand-in instead of a crash."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream.isatty():
+                stream.reconfigure(errors="replace")
+            else:
+                stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def cli():
     """Entry point for the installed `xlgit` command."""
+    _utf8_output()
     try:
         code = main(sys.argv[1:])
     except UserError as e:

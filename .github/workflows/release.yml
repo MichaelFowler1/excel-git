@@ -1,0 +1,85 @@
+# Publishing a GitHub release (tag vX.Y.Z) does everything else:
+#   - checks the tag matches xlgit.__version__ and the tests pass
+#   - builds standalone xlgit programs for Windows, macOS and Linux (no Python
+#     needed) and attaches them to the release
+#   - publishes the package to PyPI
+#
+# One-time setup for PyPI, on pypi.org: add a "trusted publisher" for the
+# project xlgit with owner MichaelFowler1, repository excel-git, workflow
+# release.yml, environment pypi. No API token is needed.
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tag matches the version in xlgit.py
+        run: |
+          version=$(python -c "import xlgit; print(xlgit.__version__)")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Release tag is $GITHUB_REF_NAME but xlgit.__version__ is $version"; exit 1
+          fi
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest tests -q
+
+  binaries:
+    needs: check
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: xlgit-windows.exe
+          - os: macos-latest
+            name: xlgit-macos-arm64
+          - os: macos-13
+            name: xlgit-macos-intel
+          - os: ubuntu-latest
+            name: xlgit-linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller .
+      - run: pyinstaller --onefile --name xlgit --collect-submodules openpyxl xlgit.py
+      - name: The program runs
+        shell: bash
+        run: |
+          exe=dist/xlgit; [ -f dist/xlgit.exe ] && exe=dist/xlgit.exe
+          "$exe" --version
+          mv "$exe" "dist/${{ matrix.name }}"
+      - name: Attach to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "dist/${{ matrix.name }}" --clobber
+
+  pypi:
+    needs: check
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+      - uses: pypa/gh-action-pypi-publish@release/v1

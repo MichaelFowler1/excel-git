@@ -1,0 +1,29 @@
+name: Setup or install problem
+description: Installing xlgit, `xlgit install`, or the GitHub Action didn't work.
+labels: ["setup"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What did you run, and what happened?
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of running `xlgit` on its own
+      description: It prints whether everything is set up.
+      render: text
+  - type: input
+    id: system
+    attributes:
+      label: Operating system, and how you installed xlgit
+      placeholder: "Windows 11, pip install xlgit (Python 3.12)  /  macOS 15, downloaded xlgit-macos"
+    validations:
+      required: true
+  - type: input
+    id: tools
+    attributes:
+      label: Git tools you use
+      placeholder: "git command line, GitHub Desktop, VS Code, SourceTree..."

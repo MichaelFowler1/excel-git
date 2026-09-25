@@ -8,8 +8,10 @@ Git and GitHub treat `.xlsx` as an opaque binary blob. You can commit, fork and 
 
 | | Without xlgit | With xlgit |
 |---|---|---|
-| `git diff` | `Binary files differ` | `-Budget!B2 1000` / `+Budget!B2 1100`, plus chart, image and comment changes |
+| `git diff` | `Binary files differ` | `changed Budget!B2 1000 -> 1100`, plus inserted, deleted and moved rows, and chart, image and comment changes |
+| Seeing changes | n/a | `xlgit diff --html`: the sheet as a grid in your browser, changes highlighted |
 | Merge, different cells edited | conflict, pick one whole file | merges cleanly |
+| Merge, one side inserted rows | conflict | the other side's edits follow their rows |
 | Merge, same cell edited | conflict | conflict on just that cell, listed in a `_merge_conflicts` sheet with a link to it |
 | Charts, images, comments, formatting, macros | n/a | kept, and their edits to them carried over |
 | Tables and pivot tables | n/a | merged: you add rows, they add a column, you get both |
@@ -19,12 +21,16 @@ Formulas are compared as formulas (`=B2+C2`), not their cached results.
 
 ## Get started
 
-You need [Python](https://www.python.org/downloads/) 3.9 or newer and git. Then, once per computer:
+You need git. Then, once per computer, either:
+
+**With Python** (3.9 or newer):
 
 ```bash
 pip install xlgit
 xlgit install
 ```
+
+**Without Python:** download the program for your computer from the [latest release](https://github.com/MichaelFowler1/excel-git/releases/latest) (`xlgit-windows.exe`, `xlgit-macos-arm64` for Apple silicon, `xlgit-macos-intel`, `xlgit-linux`), rename it to `xlgit` (`xlgit.exe` on Windows), put it somewhere it will stay, and run `xlgit install`. On Windows you can also just double-click it and it offers to set itself up. The downloads aren't code-signed yet: on Windows click "More info" then "Run anyway"; on a Mac, right-click it, choose Open, then Open again. If you move the program later, run `xlgit install` again.
 
 That's it. Every git repository on this computer now understands `.xlsx` and `.xlsm` files, including ones you clone or create later. Keep using git the way you already do.
 
@@ -38,14 +44,19 @@ Run `xlgit` on its own at any time to see the commands and check that everything
 
 ## Everyday use
 
-**See what changed.** `xlgit diff` lists every cell that changed in your workbooks since the last commit. `git diff`, `git log -p` and `git show` show cell changes too.
+**See what changed.** `xlgit diff` lists every cell that changed in your workbooks since the last commit. Inserted, deleted and moved rows show up as rows, not as every cell below them changing. `git diff`, `git log -p` and `git show` show cell changes too.
 
 ```
 $ xlgit diff
 === budget.xlsx ===
-changed        Budget!B2  1000 -> 1100
-added          Budget!A5  (empty) -> 'Gas'
+changed        Budget!C3  350 -> 999
+row inserted   Budget row 4  A: 'Gas', B: 60, C: 70, D: =B4+C4
+changed        Budget!D8  =SUM(D2:D6) -> =SUM(D2:D7)
 ```
+
+`xlgit diff --html` opens the same changes in your browser, laid out like the spreadsheet:
+
+<img src="docs/visual-diff.png" alt="Visual diff: a changed cell shows its old value, an inserted row is green, a changed SUM range is highlighted" width="480">
 
 **Merge.** `git merge` and `git pull` combine edits from both branches cell by cell. If you changed different cells, there's nothing to do.
 
@@ -59,11 +70,23 @@ xlgit merged budget.xlsx: took 3 cell(s) from the other branch, but 1 change(s) 
 
 Open the workbook, go through the `_merge_conflicts` sheet (each row links to its cell), fix the cells, delete that sheet, save, then run `git add budget.xlsx` and `git commit`. Git keeps every version, so nothing is ever lost: `git merge --abort` undoes the whole merge.
 
+## Found a problem?
+
+Please [open an issue](https://github.com/MichaelFowler1/excel-git/issues/new/choose). Bug reports on real workbooks are the most useful thing you can give this project, and you don't have to share your data to do it:
+
+```bash
+xlgit scrub --merge budget.xlsx     # during a merge that went wrong: base, yours, theirs, in one zip
+xlgit scrub old.xlsx new.xlsx       # any workbooks, e.g. for a wrong diff
+```
+
+`scrub` makes copies where every number, piece of text, comment, chart label and file property is replaced with made-up values, keeping formulas, layout, charts, tables and pivots, so the problem still shows up. Equal values stay equal across the files scrubbed together. Sheet names and named ranges are kept (formulas refer to them), macros are removed, and images are replaced with blank ones. Open the copies and check them before you share them.
+
 ## How the merge works
 
 A workbook is a zip of XML files: one per sheet, one per chart, one per image and so on. Instead of re-saving the whole thing through a spreadsheet library (which is how charts used to get lost), xlgit starts from your copy's zip and only rewrites the XML that has to change:
 
 - **Cells**: 3-way merge cell by cell. A cell only one side changed takes that side's value.
+- **Rows**: if one branch inserted, deleted or moved rows and the other edited cells, the edits land on the rows where their cells ended up, with formula references renumbered the way Excel does it. An edit to a row the other branch deleted is a conflict.
 - **Charts, images, comments, macros**: 3-way merge object by object. If only their branch changed a chart, you get their version. If both did, yours is kept and it's flagged as a conflict. Chart edits caused by cell changes (Excel caches plotted values inside the chart) don't count as edits.
 - **Tables**: merged field by field. Their new column plus your new rows gives a table with both. Tables added on their branch come over, and if both branches added a `Table2`, theirs is renamed `Table3` and their formulas are updated to match.
 - **Pivot tables**: a pivot, its data cache and the cached records merge as one bundle. A branch that only refreshed a pivot (same layout, new data) doesn't count as an edit, so your data change and their "switch to Average" merge cleanly. New pivots from their branch come over, sharing an existing cache when they used one.
@@ -85,6 +108,9 @@ xlgit uninstall [--repo]     undo the setup
 xlgit diff                   what changed in your workbooks since the last commit
 xlgit diff FILE              ... in one workbook
 xlgit diff OLD NEW           compare any two workbooks (--markdown for a table)
+xlgit diff --html [FILES]    open the changes in your browser (--out=page.html to save it)
+xlgit scrub FILE...          copies with every value made up, safe to attach to a bug report
+xlgit scrub --merge FILE     the three versions of a merge that went wrong, scrubbed, in one zip
 xlgit --version
 ```
 
@@ -145,7 +171,9 @@ python fuzz/merge_fuzz.py corpus --keep failed/
 - Until Excel refreshes a merged pivot, the numbers in its cells are the old ones. Excel does this on open, but tools that read the file without Excel (pandas, openpyxl) see the stale values.
 - Slicers, timelines and tables linked to external data connections aren't merged. They're reported as conflicts so nothing disappears silently.
 - If both branches added a chart to a sheet that had none, only yours is kept (flagged).
-- Inserting a row shows up as many changed cells, because every cell below it moves. Fixing this is next on the [roadmap](ROADMAP.md).
+- Inserted and deleted rows are followed when only one branch changed a sheet's rows. If both branches inserted or deleted rows on the same sheet, that sheet merges cell by cell, and cells that only moved can show up as conflicts.
+- Rows are recognised by their contents. A row change can't always be recognised (say, deleting one of many identical rows); then the sheet merges cell by cell and anything unclear is reported as a conflict, never guessed.
+- Inserted columns show as changed cells for now.
 - `.xls` (the old pre-2007 format) isn't supported. Save as `.xlsx`.
 
 ## Roadmap
