@@ -73,8 +73,12 @@ The tests build workbook versions with charts, comments and named ranges, run re
 - Until Excel refreshes a merged pivot, the numbers in its cells are the old ones. Excel does this on open, but tools that read the file without Excel (pandas, openpyxl) see the stale values.
 - Slicers, timelines and tables linked to external data connections aren't merged. They're reported as conflicts so nothing disappears silently.
 - If both branches added a chart to a sheet that had none, only yours is kept (flagged).
-- Inserting a row shows up as many changed cells, because every cell below it moves.
+- Inserting a row shows up as many changed cells, because every cell below it moves. Fixing this is next on the [roadmap](ROADMAP.md).
 - `.xls` (the old pre-2007 format) isn't supported. Save as `.xlsx`.
+
+## Roadmap
+
+Next up: testing against thousands of real workbooks, understanding inserted and moved rows, then code review for spreadsheets: showing what a change does to the numbers, tests that run on every pull request, and a linter. See [ROADMAP.md](ROADMAP.md).
 
 ## License
 
