@@ -105,10 +105,9 @@ def raw_value(c, sst, ref=None, shared=None):
     if f is not None:
         if f.get("t") == "shared" and shared is not None:
             if (f.text or "").strip():
-                shared[f.get("si")] = (ref, f.text)
+                shared[f.get("si")] = Translator("=" + f.text, ref)
             elif f.get("si") in shared:
-                origin, text = shared[f.get("si")]
-                return ("f", Translator("=" + text, origin).translate_formula(ref)[1:])
+                return ("f", shared[f.get("si")].translate_formula(ref)[1:])
         if not (f.text or "").strip():
             return ("sharedref",)
         return ("f", f.text or "")
@@ -146,6 +145,7 @@ class Editor:
         self.pkg = xlgit.Package(data)
         self.data = data
         self.trees = {}
+        self.rows = {}  # part -> {row number: row element}
         self.sst_part = self.pkg.target(self.pkg.workbook, "sharedStrings")
         self.sst = shared_strings(self.pkg)
         self.sst_root = self.pkg.xml(self.sst_part) if self.sst_part in self.pkg.parts else None
@@ -158,7 +158,9 @@ class Editor:
     def set(self, part, coord, value, style=None, rng=random):
         sd = self.tree(part).find(m("sheetData"))
         col, rnum = col_row(coord)
-        row = next((r for n, r in iter_rows(sd) if n == rnum), None)
+        if part not in self.rows:
+            self.rows[part] = dict(iter_rows(sd))
+        row = self.rows[part].get(rnum)
         if row is None:
             row = etree.Element(m("row"))
             row.set("r", str(rnum))
@@ -168,6 +170,7 @@ class Editor:
                 # Keep implicit numbering intact: spell every row number out.
                 for n, r in list(iter_rows(sd)):
                     r.set("r", str(n))
+            self.rows[part] = dict(iter_rows(sd))
         c = next((x for ref, x in iter_cells(row, rnum) if ref == coord), None)
         if c is None:
             for ref, x in list(iter_cells(row, rnum)):
@@ -230,9 +233,9 @@ class Editor:
                 if f is None or f.get("t") != "shared" or f.get("si") != si:
                     continue
                 if master is None and (f.text or "").strip():
-                    master = (ref, f.text)
+                    master = Translator("=" + f.text, ref)
                 elif master is not None:
-                    f.text = Translator("=" + master[1], master[0]).translate_formula(ref)[1:]
+                    f.text = master.translate_formula(ref)[1:]
                 for a in ("t", "si", "ref"):
                     f.attrib.pop(a, None)
 
@@ -492,7 +495,7 @@ def styles(pkg, part):
 
 # ---------- one file ----------
 
-def run_one(path, seed, keep=None):
+def run_one(path, seed, keep=None, writer=None):
     rng = random.Random(f"{seed}:{os.path.basename(path)}")
     res = {"file": str(path), "seed": seed}
     data = Path(path).read_bytes()
@@ -550,6 +553,14 @@ def run_one(path, seed, keep=None):
                 expect[(name, coord)] = (ov, True, None)
     obytes, tbytes = ours.save(), theirs.save()
     res["edits"] = len(expect)
+    if writer == "libreoffice":
+        try:
+            obytes = libreoffice_resave(obytes)
+            ours_problems = structural(obytes, "ours")
+        except Exception as e:
+            res.update(status="skip", reason="libreoffice could not re-save", detail=repr(e)[:200])
+            return res
+        base_problems = base_problems + ours_problems
 
     old_alarm = signal.signal(signal.SIGALRM, _timeout)
     limit = TIMEOUT + len(data) // 50_000  # a 14 MB workbook gets ~7 minutes
@@ -568,7 +579,10 @@ def run_one(path, seed, keep=None):
             except Exception as e:
                 raise Check("merge crashed", _where(e))
             Path(o).write_bytes(merged)
-            verify(pkg, data, obytes, merged, mg, expect, base_problems, o, openpyxl_ok)
+            if writer:
+                verify_three_way(data, obytes, tbytes, merged, mg, base_problems)
+            else:
+                verify(pkg, data, obytes, merged, mg, expect, base_problems, o, openpyxl_ok)
             # The diff path should cope with anything the merge handles.
             try:
                 with open(os.devnull, "w") as dn:
@@ -666,6 +680,55 @@ def verify(pkg, data, obytes, merged, mg, expect, base_problems, merged_path, op
         raise Check("part lost", repr(sorted(lost)[:3]))
 
 
+def libreoffice_resave(data):
+    """Open and save the workbook in LibreOffice Calc: a different writer,
+    which renumbers parts and rewrites strings, styles and formulas."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "ours.xlsx")
+        Path(src).write_bytes(data)
+        out = os.path.join(td, "out")
+        subprocess.run(["soffice", "--headless", f"-env:UserInstallation=file://{td}/profile",
+                        "--convert-to", "xlsx:Calc Office Open XML", "--outdir", out, src],
+                       check=True, capture_output=True, timeout=120)
+        return Path(out, "ours.xlsx").read_bytes()
+
+
+def verify_three_way(data, obytes, tbytes, merged, mg, known_problems):
+    """Check every cell against a 3-way merge computed from the raw XML
+    values of base, ours and theirs (for when ours changed in ways this file
+    didn't plan, such as a re-save by another app)."""
+    worse = new_problems(known_problems, structural(merged, "merged"))
+    if worse:
+        raise Check(f"merged: {worse[0].split(':', 1)[0]}", "; ".join(worse)[:300])
+    bpkg, opkg, tpkg, mpkg = (xlgit.Package(x) for x in (data, obytes, tbytes, merged))
+    bv, ov, tv, mv = (sheet_values(p) for p in (bpkg, opkg, tpkg, mpkg))
+    pivots = {n: xlgit.pivot_locations(p, part) for pk in (bpkg, opkg, tpkg) for n, _, part in pk.sheets()
+              for p in [pk] if part}
+    conflicts = {(s, c) for s, c, *_ in mg.conflicts}
+    for sheet in ov:
+        if sheet not in mv:
+            raise Check("sheet lost", sheet)
+        b, o, t, got = bv.get(sheet, {}), ov[sheet], tv.get(sheet, {}), mv[sheet]
+        for coord in set(b) | set(o) | set(t) | set(got):
+            x, y, z = b.get(coord), o.get(coord), t.get(coord)
+            if ("sharedref",) in (x, y, z) or any(xlgit.overlaps(coord, r) for r in pivots.get(sheet, [])):
+                continue
+            conflict = not (same(z, x) or same(y, x) or same(y, z))
+            want = t.get(coord) if same(y, x) and not same(z, x) else y
+            if conflict != ((sheet, coord) in conflicts):
+                raise Check("conflict not reported" if conflict else "false conflict",
+                            f"{sheet}!{coord} base={x} ours={y} theirs={z}")
+            if not same(got.get(coord), want):
+                raise Check("edit lost" if same(got.get(coord), y) else "cell written wrong",
+                            f"{sheet}!{coord} base={x} ours={y} theirs={z} got={got.get(coord)}")
+    oobj, mobj = xlgit.describe_objects(opkg), xlgit.describe_objects(mpkg)
+    for sheet, items in oobj.items():
+        missing = collections.Counter(items) - collections.Counter(mobj.get(sheet, []))
+        if missing:
+            raise Check("object lost or changed", f"{sheet}: {list(missing)[:2]}")
+
+
 def _eq(a, b):
     if isinstance(a, float) and isinstance(b, float):
         return a == b or (math.isnan(a) and math.isnan(b))
@@ -688,9 +751,9 @@ def _where(e):
 
 
 def _job(args):
-    path, seed, keep = args
+    path, seed, keep, writer = args
     try:
-        return run_one(path, seed, keep)
+        return run_one(path, seed, keep, writer)
     except Exception as e:
         return {"file": str(path), "seed": seed, "status": "fail", "reason": "harness error", "detail": _where(e)}
 
@@ -713,6 +776,8 @@ def main(argv=None):
     ap.add_argument("--sample", type=int, help="random sample of this many files")
     ap.add_argument("--out", default="fuzz-results.jsonl")
     ap.add_argument("--keep", help="copy base/ours/theirs/merged of failures here")
+    ap.add_argument("--writer", choices=["libreoffice"],
+                    help="re-save ours in another app before merging (needs soffice)")
     ap.add_argument("--only", help="rerun only files listed (one per line) in this file")
     a = ap.parse_args(argv)
     files = sorted(p for p in Path(a.corpus).rglob("*") if p.suffix.lower() in (".xlsx", ".xlsm")
@@ -723,7 +788,7 @@ def main(argv=None):
     if a.sample:
         files = random.Random(a.seed).sample(files, min(a.sample, len(files)))
     files = files[:a.limit]
-    jobs = [(str(f), a.seed + i, a.keep) for f in files for i in range(a.rounds)]
+    jobs = [(str(f), a.seed + i, a.keep, a.writer) for f in files for i in range(a.rounds)]
     stats, sigs = collections.Counter(), collections.defaultdict(list)
     with open(a.out, "w") as out, multiprocessing.Pool(a.jobs, maxtasksperchild=50) as pool:
         for i, r in enumerate(pool.imap_unordered(_job, jobs, chunksize=4), 1):

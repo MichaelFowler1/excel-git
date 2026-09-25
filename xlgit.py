@@ -554,11 +554,14 @@ def _cell_value(c, coord, sst, shared, dates):
         if ft == "shared" and f.get("si") is not None:
             si = f.get("si")
             if text.strip():
-                shared[si] = (coord, text)
+                shared[si] = (coord, text, None)
             elif si in shared:
-                origin, master = shared[si]
+                origin, master, tr = shared[si]
                 try:
-                    return Translator("=" + master, origin).translate_formula(coord)
+                    if tr is None:  # parsing the formula is the slow part: once per group
+                        tr = Translator("=" + master, origin)
+                        shared[si] = (origin, master, tr)
+                    return tr.translate_formula(coord)
                 except Exception:
                     return Opaque(f"shared formula {master!r}")
         if text:
