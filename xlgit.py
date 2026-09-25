@@ -26,10 +26,11 @@ import zipfile
 from collections import namedtuple
 
 from lxml import etree
-from openpyxl import load_workbook
+from openpyxl.formula.translate import Translator
+from openpyxl.styles.numbers import BUILTIN_FORMATS, is_date_format
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string, get_column_letter
-from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to_excel
-from openpyxl.worksheet.formula import ArrayFormula
+from openpyxl.utils.datetime import (CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, from_excel, from_ISO8601,
+                                     to_excel)
 
 __version__ = "0.1.0"
 
@@ -50,6 +51,8 @@ REL_CACHE = REL + "/pivotCacheDefinition"
 WORKSHEET_CT = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
 ERRORS = {"#NULL!", "#DIV/0!", "#VALUE!", "#REF!", "#NAME?", "#NUM!", "#N/A"}
 CONFLICT_SHEET = "_merge_conflicts"
+# Sheet parts holding cells: worksheets and Excel 4 macro sheets.
+SHEET_ROOTS = ("worksheet", "macrosheet")
 
 # Worksheet child order from the OOXML schema; new elements must slot in here.
 WS_ORDER = ["sheetPr", "dimension", "sheetViews", "sheetFormatPr", "cols", "sheetData",
@@ -123,6 +126,17 @@ def rename_refs(text, renames):
     return text
 
 
+def xdecode(text):
+    """Undo OOXML's _xHHHH_ escaping (a line break in a table column name is
+    stored as _x000a_)."""
+    return re.sub(r"_x([0-9A-Fa-f]{4})_", lambda mt: chr(int(mt.group(1), 16)), text or "")
+
+
+def xencode(text):
+    text = re.sub(r"_(?=x[0-9A-Fa-f]{4}_)", "_x005F_", text)
+    return re.sub(r"[\x00-\x1f]", lambda mt: f"_x{ord(mt.group(0)):04x}_", text)
+
+
 def strip_dxf(root):
     """Differential formats (dxfId) and custom table/pivot styles index into
     styles.xml; when the branches' styles differ those numbers are meaningless."""
@@ -139,6 +153,8 @@ def strip_dxf(root):
 # ---------- package (zip of XML parts) helpers ----------
 
 def rels_name(owner):
+    if owner is None:  # a sheet with no part behind it (Excel 4 macro sheets)
+        return None
     if owner == "":
         return "_rels/.rels"
     d, b = posixpath.split(owner)
@@ -179,6 +195,7 @@ class Package:
 
     def __init__(self, data=b""):
         self.parts, self.order = {}, []
+        self._ro = {}
         if data:
             with zipfile.ZipFile(io.BytesIO(data)) as z:
                 for info in z.infolist():
@@ -197,6 +214,12 @@ class Package:
 
     def xml(self, name):
         return etree.fromstring(self.parts[name]) if name in self.parts else None
+
+    def ro(self, name):
+        """Parsed part, cached: for reading only, never modify it."""
+        if name not in self._ro:
+            self._ro[name] = self.xml(name)
+        return self._ro[name]
 
     def rels(self, owner):
         """[(rId, type, target, external)]; internal targets are absolute part names."""
@@ -246,7 +269,7 @@ class Package:
         rels = {rid: (typ, t) for rid, typ, t, ext in self.rels(part) if not ext}
         if key == "comments":
             return next(((t, typ) for typ, t in rels.values() if kind_of(typ) == "comments"), (None, None))
-        el = self.xml(part).find(m(key))
+        el = self.ro(part).find(m(key))
         if el is None:
             return None, None
         typ, t = rels.get(el.get(RID), (None, None))
@@ -389,31 +412,187 @@ class Keys:
 
 # ---------- reading cells ----------
 
-def _load(path):
-    """openpyxl refuses files without an Excel extension, but git hands its
-    drivers temp files like .merge_file_a1b2c3, so read through a byte stream."""
-    with open(path, "rb") as f:
-        return load_workbook(io.BytesIO(f.read()))
+class Text(str):
+    """Text that would otherwise read as a formula or an error ("=== Total ===",
+    "#N/A" typed as text). Never equal to the formula or error it looks like."""
+
+    def __eq__(self, other):
+        return isinstance(other, Text) and str.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self == other
+
+    __hash__ = str.__hash__
 
 
-def _norm(v):
-    if isinstance(v, ArrayFormula):
-        return ArrayF(v.ref, v.text)
-    if v is not None and not isinstance(v, (str, int, float, bool, datetime.date, datetime.time, datetime.timedelta)):
-        return Opaque(f"{type(v).__name__}")
-    return v
+class DateNum(float):
+    """A number in a date-formatted cell. It merges as the exact number
+    stored; the date is only for display."""
+
+    def display(self):
+        try:
+            return from_excel(float(self)).isoformat(sep=" ").replace(" 00:00:00", "")
+        except (OverflowError, ValueError, TypeError):
+            return repr(float(self))
+
+
+def same(a, b):
+    """Cell values are equal, with TRUE never equal to 1."""
+    return a == b and (type(a) is bool) == (type(b) is bool)
+
+
+def same_cells(a, b):
+    a, b = a or {}, b or {}
+    return a.keys() == b.keys() and all(same(v, b[k]) for k, v in a.items())
+
+
+def _number(text):
+    if "_" not in text:
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return float(text)
+            except ValueError:
+                pass
+    return Opaque(f"number {text!r}")
+
+
+_F, _V, _IS = m("f"), m("v"), m("is")
+
+
+def _text(el):
+    """Plain text of a string item or inline string, skipping phonetic runs."""
+    return "".join(t.text or "" for t in el.iter(m("t"))
+                   if t.getparent() is None or local(t.getparent()) != "rPh")
+
+
+def _date_styles(pkg):
+    """Indexes of the cell styles (s="...") that show numbers as dates."""
+    part = pkg.target(pkg.workbook, "styles")
+    root = pkg.xml(part) if part in pkg.parts else None
+    xfs = root.find(m("cellXfs")) if root is not None else None
+    if xfs is None:
+        return set()
+    custom = {nf.get("numFmtId"): nf.get("formatCode") or "" for nf in root.iter(m("numFmt"))}
+    out = set()
+    for i, xf in enumerate(xfs.findall(m("xf"))):
+        fid = xf.get("numFmtId") or "0"
+        code = custom.get(fid, BUILTIN_FORMATS.get(int(fid)) if fid.isdigit() else None)
+        if code and is_date_format(code):
+            out.add(str(i))
+    return out
+
+
+def iter_sheet_cells(root):
+    """(coord, cell element) for every cell of a worksheet. References are
+    optional in the file (a row or cell without one follows the previous)."""
+    sd = root.find(m("sheetData")) if root is not None else None
+    if sd is None:
+        return
+    ROW, C = m("row"), m("c")
+    rnum = 0
+    for row in sd.iterchildren(ROW):
+        r = row.get("r")
+        rnum = int(r) if r else rnum + 1
+        prev = None  # last explicit reference, or the last column number
+        for c in row.iterchildren(C):
+            coord = c.get("r")
+            if coord is None:
+                if isinstance(prev, str):
+                    prev = column_index_from_string(coordinate_from_string(prev)[0])
+                prev = (prev or 0) + 1
+                coord = f"{get_column_letter(prev)}{rnum}"
+            else:
+                prev = coord
+            yield coord, c
+
+
+def sheet_cells(pkg, part, sst, dates=frozenset()):
+    """{coord: value} for one worksheet part, read straight from its XML.
+    Formulas are '=...' strings (shared formulas spelled out per cell), text
+    that looks like a formula or error is Text, errors are '#...' strings."""
+    root = pkg.ro(part)
+    if root is None or local(root) not in SHEET_ROOTS:
+        return {}
+    out, shared = {}, {}
+    for coord, c in iter_sheet_cells(root):
+        v = _cell_value(c, coord, sst, shared, dates)
+        if v is not None:
+            out[coord] = v
+    return out
+
+
+def _cell_value(c, coord, sst, shared, dates):
+    t = c.get("t", "n")
+    f = v = is_ = None
+    for ch in c:
+        tag = ch.tag
+        if tag == _V:
+            v = ch
+        elif tag == _F:
+            f = ch
+        elif tag == _IS:
+            is_ = ch
+    if f is not None:
+        ft = f.get("t")
+        text = f.text or ""
+        if ft == "array":
+            return ArrayF(f.get("ref") or coord, "=" + text)
+        if ft == "dataTable":
+            return Opaque("data table")
+        if ft == "shared" and f.get("si") is not None:
+            si = f.get("si")
+            if text.strip():
+                shared[si] = (coord, text)
+            elif si in shared:
+                origin, master = shared[si]
+                try:
+                    return Translator("=" + master, origin).translate_formula(coord)
+                except Exception:
+                    return Opaque(f"shared formula {master!r}")
+        if text:
+            return "=" + text
+    if t == "inlineStr":
+        v = _text(is_) if is_ is not None else None
+        return Text(v) if v is not None and (v.startswith("=") or v in ERRORS) else v
+    if v is None or v.text is None:
+        return None
+    if t == "n":
+        n = _number(v.text)
+        return DateNum(n) if dates and c.get("s") in dates and not isinstance(n, Opaque) else n
+    if t == "s":
+        try:
+            s = sst[int(v.text)]
+        except (ValueError, IndexError):
+            return Opaque(f"missing shared string {v.text}")
+        return Text(s) if s.startswith("=") or s in ERRORS else s
+    if t == "str":
+        return Text(v.text) if v.text.startswith("=") or v.text in ERRORS else v.text
+    if t == "b":
+        return v.text.strip() in ("1", "true")
+    if t == "e":
+        return v.text
+    if t == "d":
+        try:
+            return from_ISO8601(v.text)
+        except ValueError:
+            return Opaque(f"date {v.text!r}")
+    n = _number(v.text)
+    return DateNum(n) if c.get("s") in dates and isinstance(n, (int, float)) else n
+
+
+def read_package_cells(pkg):
+    """{sheet: {coord: value}} in workbook order."""
+    sst = [_text(si) for si in pkg.shared_strings()]
+    dates = _date_styles(pkg)
+    return {name: sheet_cells(pkg, part, sst, dates)
+            for name, _, part in pkg.sheets() if part in pkg.parts and local(pkg.ro(part)) in SHEET_ROOTS}
 
 
 def read_cells(path):
     """Return {sheet: {coord: value}} where formulas stay as '=...' strings."""
-    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
-        return {}
-    wb = _load(path)
-    out = {}
-    for ws in wb.worksheets:
-        out[ws.title] = {c.coordinate: _norm(c.value)
-                         for row in ws.iter_rows() for c in row if c.value is not None}
-    return out
+    return read_package_cells(Package.open(path))
 
 
 def fmt(v):
@@ -423,6 +602,10 @@ def fmt(v):
         return "{" + v.text + "}"
     if isinstance(v, Opaque):
         return f"<{v.desc}>"
+    if isinstance(v, Text):
+        return repr(str(v))
+    if isinstance(v, DateNum):
+        return v.display()
     return repr(v) if isinstance(v, str) and not v.startswith("=") else str(v)
 
 
@@ -581,7 +764,7 @@ def diff_cells(old, new):
         o, n = old.get(sheet, {}), new.get(sheet, {})
         for coord in sorted(set(o) | set(n), key=_cell_sort_key):
             ov, nv = o.get(coord), n.get(coord)
-            if ov != nv:
+            if not same(ov, nv):
                 kind = "added" if ov is None else "removed" if nv is None else "changed"
                 yield (kind, sheet, coord, ov, nv)
 
@@ -666,7 +849,7 @@ class Merger:
 
     def __init__(self, base_path, ours_path, theirs_path):
         self.b, self.o, self.t = (Package.open(p) for p in (base_path, ours_path, theirs_path))
-        self.bc, self.oc, self.tc = (read_cells(p) for p in (base_path, ours_path, theirs_path))
+        self.bc, self.oc, self.tc = (read_package_cells(p) for p in (self.b, self.o, self.t))
         self.res = dict(self.o.parts)
         self.order = list(self.o.order)
         self.trees = {}
@@ -878,11 +1061,11 @@ class Merger:
                 self.merge_sheet(bname, o, t)
                 self.merge_sheet_name(bname, o, t)
             elif o:
-                if self.oc.get(o) == self.bc.get(bname):
+                if same_cells(self.oc.get(o), self.bc.get(bname)):
                     self.delete_sheet(o)
                 else:
                     self.conflict(o, "(sheet)", "exists", "edited", "deleted")
-            elif t and self.tc.get(t) != self.bc.get(bname):
+            elif t and not same_cells(self.tc.get(t), self.bc.get(bname)):
                 self.conflict(t, "(sheet)", "exists", "deleted", "edited")
         ours_from_base = set(bo.values())
         for tname, _, tpart in ts:
@@ -920,9 +1103,9 @@ class Merger:
         edits = {}
         for coord in set(b) | set(t):
             bv, ov, tv = b.get(coord), o.get(coord), t.get(coord)
-            if tv == bv or tv == ov:
+            if same(tv, bv) or same(tv, ov):
                 continue
-            if ov == bv and not isinstance(tv, Opaque):
+            if same(ov, bv) and not isinstance(tv, Opaque):
                 edits[coord] = tv
             elif any(overlaps(coord, ref) for ref in pivot_areas):
                 self.stale_pivots = True
@@ -939,16 +1122,20 @@ class Merger:
         part = self.sheet_map()[oname][1]
         root = self.tree(part)
         sd = root.find(m("sheetData"))
+        if sd is None:
+            sd = etree.SubElement(root, m("sheetData"))
+            self.place(root, sd, WS_ORDER)
+        self.spell_out_refs(sd)
         self.unshare_formulas(root, self.oc.get(oname, {}))
         # Style numbers index into styles.xml, so theirs only carry over when
         # both branches have the same styles.xml, and only if we didn't restyle.
         their_styles, base_styles = {}, None
         if self.same_styles:
             tpart = dict((n, p) for n, _, p in self.t.sheets())[tname]
-            their_styles = {c.get("r"): c.get("s") for c in self.t.xml(tpart).iter(m("c"))}
+            their_styles = {ref: c.get("s") for ref, c in iter_sheet_cells(self.t.ro(tpart))}
             bpart = dict((n, p) for n, _, p in self.b.sheets()).get(self.lineage_o.get(oname))
             if bpart and self.b.styles_bytes() == self.o.styles_bytes():
-                base_styles = {c.get("r"): c.get("s") for c in self.b.xml(bpart).iter(m("c"))}
+                base_styles = {ref: c.get("s") for ref, c in iter_sheet_cells(self.b.ro(bpart))}
         rows = {}
         last = 0
         for row in sd.findall(m("row")):
@@ -972,6 +1159,22 @@ class Merger:
                 sd.remove(row)
         self.update_dimension(root)
 
+    @staticmethod
+    def spell_out_refs(sd):
+        """Row and cell references are optional in the file format (the next
+        row, the next column); write them all out before inserting anything."""
+        rnum = 0
+        for row in sd.findall(m("row")):
+            rnum = int(row.get("r")) if row.get("r") else rnum + 1
+            row.set("r", str(rnum))
+            col = 0
+            for c in row.findall(m("c")):
+                if c.get("r"):
+                    col = column_index_from_string(coordinate_from_string(c.get("r"))[0])
+                else:
+                    col += 1
+                    c.set("r", f"{get_column_letter(col)}{rnum}")
+
     def unshare_formulas(self, root, values):
         """Shared formulas are stored once and implied for a range; editing one
         cell of the range would break the rest, so spell each one out."""
@@ -979,7 +1182,7 @@ class Merger:
             f = c.find(m("f"))
             if f is not None and f.get("t") == "shared":
                 v = values.get(c.get("r"))
-                if isinstance(v, str) and v.startswith("="):
+                if isinstance(v, str) and not isinstance(v, Text) and v.startswith("="):
                     f.text = v[1:]
                     for a in ("t", "ref", "si"):
                         f.attrib.pop(a, None)
@@ -1028,12 +1231,12 @@ class Merger:
             c.set("t", "b")
             new.append(self._sub(c, "v", "1" if v else "0"))
         elif isinstance(v, (int, float)):
-            new.append(self._sub(c, "v", repr(v)))
+            new.append(self._sub(c, "v", repr(int(v) if type(v) is int else float(v))))
         elif isinstance(v, (datetime.date, datetime.time, datetime.timedelta)):
             new.append(self._sub(c, "v", repr(to_excel(v, self.epoch))))
-        elif v.startswith("=") and len(v) > 1 and not as_text:
+        elif v.startswith("=") and len(v) > 1 and not as_text and not isinstance(v, Text):
             new.append(self._sub(c, "f", v[1:]))
-        elif v in ERRORS and not as_text:
+        elif v in ERRORS and not as_text and not isinstance(v, Text):
             c.set("t", "e")
             new.append(self._sub(c, "v", v))
         else:
@@ -1234,7 +1437,7 @@ class Merger:
         if self.table_renames:
             for cells in self.tc.values():
                 for coord, v in cells.items():
-                    if isinstance(v, str) and v.startswith("="):
+                    if isinstance(v, str) and not isinstance(v, Text) and v.startswith("="):
                         cells[coord] = rename_refs(v, self.table_renames)
 
     # --- whole sheets ---
@@ -1540,13 +1743,14 @@ class Merger:
                     strip_dxf(root)
             if (tpart in self.touched_tables or spart in self.trees) and root.get("headerRowCount") != "0":
                 c1, r1, _, _ = parse_ref(root.get("ref"))
-                cells = {c.get("r"): c for c in self.tree(spart).iter(m("c"))}
+                cells = dict(iter_sheet_cells(self.tree(spart)))
                 cols = list(root.find(m("tableColumns")))
-                names = [self.cell_text(cells.get(f"{get_column_letter(c1 + i)}{r1}")) or col.get("name")
+                names = [self.cell_text(cells.get(f"{get_column_letter(c1 + i)}{r1}")) or xdecode(col.get("name"))
                          for i, col in enumerate(cols)]
                 if len({n.lower() for n in names}) == len(names):
                     for col, n in zip(cols, names):
-                        col.set("name", n)
+                        if xdecode(col.get("name")) != n:
+                            col.set("name", xencode(n))
 
     # --- pivot tables ---
 
