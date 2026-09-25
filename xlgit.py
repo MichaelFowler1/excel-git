@@ -2575,7 +2575,8 @@ def merge(base_path, ours_path, theirs_path, display_path=None):
             f"  Your version is kept, unchanged. To take theirs instead:\n"
             f"    git checkout --theirs -- \"{name}\"\n"
             f"  Then: git add \"{name}\"  and  git commit\n"
-            f"  Please report this at {ISSUES} so it can be fixed.")
+            f"  Please report this at {ISSUES} so it can be fixed. To share the files safely:\n"
+            f"    xlgit scrub --merge \"{name}\"")
         return 1
     with open(ours_path, "wb") as f:
         f.write(data)
@@ -2612,6 +2613,310 @@ def _reason(e):
     if isinstance(e, etree.XMLSyntaxError):
         return f"the workbook is damaged: {e}"
     return f"{type(e).__name__}: {e}"
+
+
+# ---------- scrub: shareable copies for bug reports ----------
+
+_TINY = {  # 1x1 images that stand in for the originals
+    "png": bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+                         "1f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082"),
+    "gif": bytes.fromhex("47494638396101000100800000ffffff00000021f90401000000002c00000000010001000002024401003b"),
+    "jpeg": bytes.fromhex("ffd8ffe000104a46494600010100000100010000ffdb004300080606070605080707070909080a0c140d0c0b0b0c"
+                          "1912130f141d1a1f1e1d1a1c1c20242e2720222c231c1c2837292c30313434341f27393d38323c2e333432ffc000"
+                          "0b080001000101011100ffc4001f0000010501010101010100000000000000000102030405060708090a0bffc400"
+                          "b5100002010303020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c1"
+                          "1552d1f02433627282090a161718191a25262728292a3435363738393a434445464748494a535455565758595a"
+                          "636465666768696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5"
+                          "b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffda00"
+                          "080101000003f00fbfffd9"),
+}
+_NUM = re.compile(r"^(-?)(\d+)(?:\.(\d+))?([eE][-+]?\d+)?$")
+C_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+
+
+class Scrubber:
+    """Replaces every piece of text and every number in workbooks with made-up
+    ones, keeping their structure, so a workbook that trips xlgit up can be
+    shared in a bug report. Equal values stay equal (across all the files
+    scrubbed together), so a merge of scrubbed versions behaves the same."""
+
+    def __init__(self, key=None):
+        self.key = key or os.urandom(16)
+        self.kept = set()
+
+    def _rng(self, kind, value):
+        import hmac
+        import random
+        return random.Random(hmac.new(self.key, f"{kind}\0{value}".encode(), "sha256").digest())
+
+    def text(self, s):
+        if not s or s in ERRORS or s.upper() in ("TRUE", "FALSE"):
+            return s
+        rng = self._rng("t", s)
+        lower, upper = "abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        return "".join(rng.choice(lower) if ch.islower() else rng.choice(upper) if ch.isupper()
+                       else rng.choice("0123456789") if ch.isdigit()
+                       else rng.choice(lower) if ch.isalpha() else ch for ch in s)
+
+    def number(self, text, date=False):
+        try:
+            value = float(text)
+        except (TypeError, ValueError):
+            return text
+        if value == 0 or value != value:
+            return text
+        # Numbers xlgit treats as equal (to 15 digits) get the same stand-in.
+        text = f"{value:.15g}"
+        mt = _NUM.match(text)
+        if not mt:
+            return text
+        sign, whole, frac, exp = mt.groups()
+        rng = self._rng("n", text)
+        if date:  # somewhere in 1998-2028, keeping any time of day
+            whole = str(rng.randint(36000, 47000))
+        else:
+            whole = "".join(rng.choice("123456789" if i == 0 and len(whole) > 1 else "0123456789")
+                            for i in range(len(whole)))
+        frac = "".join(rng.choice("0123456789") for _ in frac or "")
+        if frac and not frac.strip("0"):
+            frac = frac[:-1] + "5"
+        return f"{sign}{whole}{'.' + frac if frac else ''}{exp or ''}"
+
+    def formula(self, f):
+        """Text inside quotes in a formula is data too."""
+        if '"' not in f:
+            return f
+        try:
+            from openpyxl.formula.tokenizer import Tokenizer
+            tok = Tokenizer("=" + f)
+        except Exception:
+            return re.sub(r'"((?:[^"]|"")*)"', lambda mt: '"' + self.text(mt.group(1).replace('""', '"'))
+                          .replace('"', '""') + '"', f)
+        for t in tok.items:
+            if t.type == "OPERAND" and t.subtype == "TEXT":
+                inner = t.value[1:-1].replace('""', '"')
+                t.value = '"' + self.text(inner).replace('"', '""') + '"'
+        return tok.render()[1:]
+
+    def _texts(self, root, tags):
+        for el in root.iter(*tags):
+            if el.text:
+                el.text = self.text(el.text)
+
+    def scrub(self, data):
+        pkg = Package(data)
+        dates = _date_styles(pkg)
+        out, dropped = {}, set()
+        for name in pkg.order:
+            part = pkg.parts[name]
+            lower = name.lower()
+            ext = lower.rsplit(".", 1)[-1]
+            if lower.endswith("vbaproject.bin") or lower.endswith("vbadata.xml"):
+                dropped.add(name)
+                self.kept.add("macros removed")
+                continue
+            if lower.startswith("xl/media/") or "/media/" in lower:
+                if ext in ("png", "gif") or ext in ("jpg", "jpeg"):
+                    out[name] = _TINY["jpeg" if ext in ("jpg", "jpeg") else ext]
+                else:
+                    out[name] = part
+                    self.kept.add(f"images in .{ext} format kept as they are")
+                continue
+            if not lower.endswith((".xml", ".rels", ".vml")):
+                out[name] = part
+                continue
+            try:
+                root = parse_xml(part)
+            except etree.XMLSyntaxError:
+                out[name] = part
+                continue
+            self._scrub_part(name, root, pkg, dates)
+            out[name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        if dropped:
+            self._unlink(out, dropped)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for name in pkg.order:
+                if name in out:
+                    z.writestr(name, out[name])
+        return buf.getvalue()
+
+    def _unlink(self, out, dropped):
+        for name in list(out):
+            if name.endswith(".rels"):
+                root = parse_xml(out[name])
+                owner = name.replace("_rels/", "")[:-5]
+                owner = "" if owner == "." else owner
+                for r in list(root):
+                    if r.get("TargetMode") != "External" and resolve(owner, r.get("Target")) in dropped:
+                        root.remove(r)
+                out[name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        ct = parse_xml(out["[Content_Types].xml"])
+        for o in list(ct):
+            if (o.get("PartName") or "").lstrip("/") in dropped:
+                ct.remove(o)
+        out["[Content_Types].xml"] = etree.tostring(ct, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    def _scrub_part(self, name, root, pkg, dates):
+        tag = local(root)
+        if name.endswith(".rels"):
+            for r in root:
+                if r.get("TargetMode") == "External":
+                    r.set("Target", "https://example.com/" if "hyperlink" in (r.get("Type") or "")
+                          else "external.xlsx")
+            return
+        if tag in ("worksheet", "macrosheet", "externalLink", "dialogsheet"):
+            self._scrub_cells(root, dates)
+            self._texts(root, (m("oddHeader"), m("oddFooter"), m("evenHeader"), m("evenFooter"),
+                               m("firstHeader"), m("firstFooter")))
+            for el in root.iter(m("hyperlink")):
+                for a in ("display", "tooltip"):
+                    if el.get(a):
+                        el.set(a, self.text(el.get(a)))
+            return
+        if tag == "sst":
+            for si in root.iter(m("si")):
+                for rph in list(si.iter(m("rPh"))):
+                    rph.getparent().remove(rph)
+                self._texts(si, (m("t"),))
+            return
+        if tag == "table":
+            for col in root.iter(m("tableColumn")):
+                col.set("name", xencode(self.text(xdecode(col.get("name")))))
+                for a in ("totalsRowLabel",):
+                    if col.get(a):
+                        col.set(a, self.text(col.get(a)))
+            for f in root.iter(m("calculatedColumnFormula"), m("totalsRowFormula")):
+                if f.text:
+                    f.text = self.formula(f.text)
+            return
+        if tag == "pivotCacheDefinition":
+            for cf in root.iter(m("cacheField")):
+                cf.set("name", self.text(cf.get("name")))
+            self._scrub_items(root)
+            return
+        if tag == "pivotCacheRecords":
+            self._scrub_items(root)
+            return
+        if tag == "pivotTableDefinition":
+            for el in root.iter(m("item"), m("pivotField"), m("dataField")):
+                if el.get("n"):
+                    el.set("n", self.text(el.get("n")))
+                if local(el) == "dataField" and el.get("name"):
+                    el.set("name", self.text(el.get("name")))
+            return
+        if tag in ("comments", "ThreadedComments", "personList", "chartSpace", "wsDr", "userShapes"):
+            for el in root.iter():
+                if not isinstance(el.tag, str):
+                    continue
+                ln = local(el)
+                if ln in ("t", "text") and el.text:
+                    el.text = self.text(el.text)
+                elif ln == "v" and el.text and el.getparent() is not None and local(el.getparent()) == "pt":
+                    cache = el.getparent().getparent()
+                    el.text = self.number(el.text) if cache is not None and local(cache) == "numCache" \
+                        else self.text(el.text)
+                if el.get("displayName") and ln == "person":
+                    el.set("displayName", self.text(el.get("displayName")))
+                if el.get("authorId") is None and ln == "author" and el.text:
+                    el.text = self.text(el.text)
+            return
+        if tag in ("coreProperties", "Properties"):
+            for el in root.iter():
+                if isinstance(el.tag, str) and local(el) in (
+                        "creator", "lastModifiedBy", "title", "subject", "description", "keywords",
+                        "category", "Company", "Manager", "HyperlinkBase", "Template"):
+                    el.text = ""
+            return
+        if "vml" in name.lower():
+            for el in root.iter():
+                if isinstance(el.tag, str) and el.text and el.text.strip() and len(el) == 0 \
+                        and local(el) not in ("Anchor", "Row", "Column", "ClientData"):
+                    el.text = self.text(el.text)
+            return
+
+    def _scrub_items(self, root):
+        for el in root.iter(m("s"), m("n"), m("d"), m("e")):
+            v = el.get("v")
+            if v is None:
+                continue
+            if local(el) == "s":
+                el.set("v", self.text(v))
+            elif local(el) == "n":
+                el.set("v", self.number(v))
+        for el in root.iter(m("sharedItems")):
+            for a in ("minValue", "maxValue"):
+                if el.get(a):
+                    del el.attrib[a]
+
+    def _scrub_cells(self, root, dates):
+        for c in root.iter(m("c")):
+            t = c.get("t")
+            f = c.find(m("f"))
+            v = c.find(m("v"))
+            if f is not None:
+                if f.text:
+                    f.text = self.formula(f.text)
+                if v is not None:  # a cached result: Excel recalculates it on open
+                    c.remove(v)
+                if t in ("str", "s", "e", "b"):
+                    c.attrib.pop("t", None)
+                continue
+            if t == "inlineStr":
+                is_ = c.find(m("is"))
+                if is_ is not None:
+                    self._texts(is_, (m("t"),))
+            elif t == "str" and v is not None and v.text:
+                v.text = self.text(v.text)
+            elif t in (None, "n") and v is not None and v.text:
+                v.text = self.number(v.text, date=c.get("s") in dates)
+
+
+def scrub_files(paths, merge_of=None):
+    """Write NAME.scrubbed.xlsx next to each file, all with one mapping."""
+    sc = Scrubber()
+    written = []
+    for p in paths:
+        with open(p, "rb") as f:
+            data = f.read()
+        stem, ext = os.path.splitext(p)
+        out = f"{stem}.scrubbed{ext or '.xlsx'}"
+        with open(out, "wb") as f:
+            f.write(sc.scrub(data))
+        written.append(out)
+    return written, sc
+
+
+def scrub_merge(path):
+    """During a merge with a conflict on PATH: scrub the three versions git
+    keeps (base, yours, theirs) into one zip for a bug report."""
+    root = repo_root()
+    if not root:
+        raise UserError("run this inside the repository where the merge happened.")
+    rel = os.path.relpath(os.path.abspath(path), root).replace("\\", "/")
+    blobs = {}
+    for stage, label in ((1, "base"), (2, "ours"), (3, "theirs")):
+        r = subprocess.run(["git", "show", f":{stage}:{rel}"], cwd=root, capture_output=True)
+        if r.returncode:
+            raise UserError(f"git has no {label} version of {rel}; is a merge of it in progress? "
+                            "(To scrub files directly: xlgit scrub FILE...)")
+        blobs[label] = r.stdout
+    sc = Scrubber()
+    stem = os.path.splitext(os.path.basename(rel))[0]
+    out = os.path.abspath(f"{stem}-merge-report.zip")
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for label, data in blobs.items():
+            z.writestr(f"{label}.xlsx", sc.scrub(data))
+        z.writestr("README.txt", f"xlgit {__version__} merge report for {stem}: base, ours and theirs, scrubbed.\n")
+    return out, sc
+
+
+def _scrub_notice(sc):
+    kept = "; ".join(sorted(sc.kept))
+    return ("  Every cell value, text box, comment, chart label and file property was replaced with made-up\n"
+            "  values (equal values stay equal). Kept as they were: sheet names, named ranges, formulas\n"
+            "  (text in quotes replaced), formatting and layout" + (f"; {kept}" if kept else "") + ".\n"
+            "  Open it and check before you share it.")
 
 
 # ---------- setup ----------
@@ -2788,6 +3093,10 @@ Everyday:
   xlgit diff OLD NEW         compare any two workbooks
   xlgit diff --html          see the changes as a highlighted grid in your browser
 
+Reporting a problem:
+  xlgit scrub FILE...        a copy with every value made up, safe to attach to a bug report
+  xlgit scrub --merge FILE   the three versions of a merge that went wrong, scrubbed, in one zip
+
 More:
   xlgit install --repo       set up only the current repository
   xlgit uninstall [--repo]   undo the setup
@@ -2889,8 +3198,15 @@ def main(argv):
         return 0
     if cmd is None or cmd == "help" or "--help" in flags or "-h" in args:
         print(HELP)
-        for line in status_lines():
+        status = status_lines()
+        for line in status:
             print(line)
+        # Opened by double-clicking the standalone download: offer to set up.
+        if cmd is None and getattr(sys, "frozen", False) and sys.stdin and sys.stdin.isatty():
+            if status and not status[0].startswith("[ok]"):
+                if input("\nSet up xlgit for git on this computer now? [Y/n] ").strip().lower() in ("", "y", "yes"):
+                    install("global")
+            input("\nPress Enter to close.")
         return 0
     if cmd == "textconv":
         # git diff and git log -p call this; never fail them over one bad file.
@@ -2954,6 +3270,24 @@ def main(argv):
         return 0
     if cmd == "uninstall":
         uninstall("repo" if "--repo" in flags else "global")
+        return 0
+    if cmd == "scrub":
+        if "--merge" in flags:
+            if len(args) != 1:
+                raise UserError("usage: xlgit scrub --merge FILE   (while a merge of FILE has a conflict)")
+            out, sc = scrub_merge(args[0])
+            print(f"Wrote {out} (base, yours and theirs, scrubbed).")
+            print(_scrub_notice(sc))
+            return 0
+        if not args:
+            raise UserError("usage: xlgit scrub FILE [FILE...]   or   xlgit scrub --merge FILE")
+        for p in args:
+            if not os.path.exists(p):
+                raise UserError(f"no such file: {p}")
+        written, sc = scrub_files(args)
+        for w in written:
+            print(f"Wrote {w}")
+        print(_scrub_notice(sc))
         return 0
     if cmd == "status":
         for line in status_lines():

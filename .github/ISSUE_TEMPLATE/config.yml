@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question or idea
+    url: https://github.com/MichaelFowler1/excel-git/discussions
+    about: Ask how to do something, or suggest a feature.

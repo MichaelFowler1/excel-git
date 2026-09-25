@@ -1,0 +1,46 @@
+name: A merge went wrong
+description: A cell, row, chart, table or pivot came out wrong, went missing, or a merge failed.
+labels: ["bug", "merge"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. Nothing is lost: git keeps every version, and `git merge --abort` undoes a merge.
+
+        **The fastest way to get it fixed is to attach the three versions of the file.** While the merge is still in progress, run:
+
+        ```
+        xlgit scrub --merge "your file.xlsx"
+        ```
+
+        That writes a zip with the base, your and their versions, with every value replaced by made-up ones (equal values stay equal, so the bug still happens). Sheet names, named ranges and formulas are kept: open the files and check them before attaching.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      placeholder: "Their new row 12 ended up at row 15, and my edit to C20 was lost."
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: What xlgit printed during the merge
+      render: text
+  - type: textarea
+    id: files
+    attributes:
+      label: Files
+      description: Drag the zip from `xlgit scrub --merge` here. If you can't share even scrubbed files, say what's in the workbook (charts, pivots, tables, macros, how big).
+  - type: input
+    id: version
+    attributes:
+      label: xlgit version
+      description: Output of `xlgit --version`
+    validations:
+      required: true
+  - type: dropdown
+    id: saved-with
+    attributes:
+      label: What saved the workbooks?
+      multiple: true
+      options: [Excel for Windows, Excel for Mac, Excel on the web, LibreOffice, Google Sheets, A script (openpyxl, pandas...), Something else]

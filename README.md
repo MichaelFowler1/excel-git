@@ -21,12 +21,16 @@ Formulas are compared as formulas (`=B2+C2`), not their cached results.
 
 ## Get started
 
-You need [Python](https://www.python.org/downloads/) 3.9 or newer and git. Then, once per computer:
+You need git. Then, once per computer, either:
+
+**With Python** (3.9 or newer):
 
 ```bash
 pip install xlgit
 xlgit install
 ```
+
+**Without Python:** download the program for your computer from the [latest release](https://github.com/MichaelFowler1/excel-git/releases/latest) (`xlgit-windows.exe`, `xlgit-macos-arm64` for Apple silicon, `xlgit-macos-intel`, `xlgit-linux`), rename it to `xlgit` (`xlgit.exe` on Windows), put it somewhere it will stay, and run `xlgit install`. On Windows you can also just double-click it and it offers to set itself up. The downloads aren't code-signed yet: on Windows click "More info" then "Run anyway"; on a Mac, right-click it, choose Open, then Open again. If you move the program later, run `xlgit install` again.
 
 That's it. Every git repository on this computer now understands `.xlsx` and `.xlsm` files, including ones you clone or create later. Keep using git the way you already do.
 
@@ -66,6 +70,17 @@ xlgit merged budget.xlsx: took 3 cell(s) from the other branch, but 1 change(s) 
 
 Open the workbook, go through the `_merge_conflicts` sheet (each row links to its cell), fix the cells, delete that sheet, save, then run `git add budget.xlsx` and `git commit`. Git keeps every version, so nothing is ever lost: `git merge --abort` undoes the whole merge.
 
+## Found a problem?
+
+Please [open an issue](https://github.com/MichaelFowler1/excel-git/issues/new/choose). Bug reports on real workbooks are the most useful thing you can give this project, and you don't have to share your data to do it:
+
+```bash
+xlgit scrub --merge budget.xlsx     # during a merge that went wrong: base, yours, theirs, in one zip
+xlgit scrub old.xlsx new.xlsx       # any workbooks, e.g. for a wrong diff
+```
+
+`scrub` makes copies where every number, piece of text, comment, chart label and file property is replaced with made-up values, keeping formulas, layout, charts, tables and pivots, so the problem still shows up. Equal values stay equal across the files scrubbed together. Sheet names and named ranges are kept (formulas refer to them), macros are removed, and images are replaced with blank ones. Open the copies and check them before you share them.
+
 ## How the merge works
 
 A workbook is a zip of XML files: one per sheet, one per chart, one per image and so on. Instead of re-saving the whole thing through a spreadsheet library (which is how charts used to get lost), xlgit starts from your copy's zip and only rewrites the XML that has to change:
@@ -94,6 +109,8 @@ xlgit diff                   what changed in your workbooks since the last commi
 xlgit diff FILE              ... in one workbook
 xlgit diff OLD NEW           compare any two workbooks (--markdown for a table)
 xlgit diff --html [FILES]    open the changes in your browser (--out=page.html to save it)
+xlgit scrub FILE...          copies with every value made up, safe to attach to a bug report
+xlgit scrub --merge FILE     the three versions of a merge that went wrong, scrubbed, in one zip
 xlgit --version
 ```
 

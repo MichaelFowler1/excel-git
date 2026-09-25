@@ -1,0 +1,26 @@
+name: A diff is wrong or confusing
+description: xlgit diff, git diff, the visual diff or a pull request comment showed something wrong or hard to follow.
+labels: ["bug", "diff"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What did it show, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: The output
+      render: text
+  - type: textarea
+    id: files
+    attributes:
+      label: Files
+      description: Run `xlgit scrub old.xlsx new.xlsx` (both at once, so equal values stay equal) and attach the two `.scrubbed.xlsx` files. Check them before attaching.
+  - type: input
+    id: version
+    attributes:
+      label: xlgit version
+    validations:
+      required: true

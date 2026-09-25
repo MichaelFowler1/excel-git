@@ -148,3 +148,48 @@ def test_pr_comment(env, tmp_path):
     assert r.returncode == 0, r.stderr
     assert r.stdout.startswith("<!-- xlgit-pr-comment -->")
     assert "| Data | B1 | changed | 1000 | 1100 |" in r.stdout
+
+
+def test_scrub_keeps_structure_and_equal_values(env, tmp_path):
+    import zipfile
+    import xlgit
+    path = book(tmp_path / "secret.xlsx", {"A1": "Acme Corp", "A2": "Acme Corp", "B1": 1234.5, "B2": 1234.5, "C1": 0})
+    with zipfile.ZipFile(path) as z:
+        parts = {n: z.read(n) for n in z.namelist()}
+    xml = parts["xl/worksheets/sheet1.xml"].decode()
+    parts["xl/worksheets/sheet1.xml"] = xml.replace("</row>", '<c r="D1"><f>IF(B1&gt;0,"Acme Corp","x")</f><v>9</v></c></row>', 1).encode()
+    parts["docProps/core.xml"] = parts["docProps/core.xml"].replace(b"</cp:coreProperties>",
+        b"<dc:creator>Jane Secret</dc:creator></cp:coreProperties>")
+    with zipfile.ZipFile(path, "w") as z:
+        for n, d in parts.items():
+            z.writestr(n, d)
+    r = run(env, tmp_path, "scrub", path)
+    assert r.returncode == 0, r.stderr
+    out = tmp_path / "secret.scrubbed.xlsx"
+    cells = xlgit.read_cells(str(out))["Data"]
+    assert cells["A1"] == cells["A2"] != "Acme Corp" and len(cells["A1"]) == len("Acme Corp")
+    assert cells["B1"] == cells["B2"] != 1234.5 and cells["C1"] == 0
+    assert cells["D1"].startswith('=IF(B1>0,"') and "Acme" not in cells["D1"]
+    blob = b"".join(zipfile.ZipFile(out).read(n) for n in zipfile.ZipFile(out).namelist())
+    assert b"Acme" not in blob and b"Jane Secret" not in blob and b"1234.5" not in blob
+
+
+def test_scrub_merge_report(env, tmp_path):
+    run(env, tmp_path, "install")
+    repo = new_repo(env, tmp_path / "r")
+    book(repo / "b.xlsx", {"A1": "Private", "B1": 1})
+    git(env, repo, "add", "-A")
+    git(env, repo, "commit", "-qm", "base")
+    git(env, repo, "checkout", "-qb", "other")
+    book(repo / "b.xlsx", {"A1": "Private", "B1": 2})
+    git(env, repo, "commit", "-qam", "two")
+    git(env, repo, "checkout", "-q", "main")
+    book(repo / "b.xlsx", {"A1": "Private", "B1": 3})
+    git(env, repo, "commit", "-qam", "three")
+    subprocess.run(["git", "merge", "other"], cwd=repo, env=env, capture_output=True)
+    r = run(env, repo, "scrub", "--merge", "b.xlsx")
+    assert r.returncode == 0, r.stderr
+    import zipfile
+    z = zipfile.ZipFile(repo / "b-merge-report.zip")
+    assert {"base.xlsx", "ours.xlsx", "theirs.xlsx"} <= set(z.namelist())
+    assert all(b"Private" not in z.read(n) for n in z.namelist() if n.endswith(".xlsx"))

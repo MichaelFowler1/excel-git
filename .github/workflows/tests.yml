@@ -25,3 +25,23 @@ jobs:
           pip install dist/*.whl
           xlgit --version
         shell: bash
+
+  standalone:
+    # The release attaches these programs; make sure they build and run on every push.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller .
+      - run: pyinstaller --onefile --name xlgit --collect-submodules openpyxl xlgit.py
+      - name: Runs, and diffs a workbook
+        shell: bash
+        run: |
+          exe=dist/xlgit; [ -f dist/xlgit.exe ] && exe=dist/xlgit.exe
+          "$exe" --version
+          "$exe" diff examples/budget.xlsx examples/budget.xlsx
