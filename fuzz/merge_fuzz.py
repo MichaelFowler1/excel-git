@@ -910,6 +910,24 @@ def row_op_eligible(pkg, name, part):
     return bool(root.find(m("sheetData")) is not None and len(root.find(m("sheetData"))))
 
 
+def unshare_all(sd):
+    """Spell out every shared formula in one pass (Excel does this when
+    rows move under them)."""
+    masters = {}
+    for rnum, row in iter_rows(sd):
+        for ref, c in iter_cells(row, rnum):
+            f = c.find(m("f"))
+            if f is None or f.get("t") != "shared":
+                continue
+            si = f.get("si")
+            if (f.text or "").strip() and si not in masters:
+                masters[si] = Translator("=" + f.text, ref)
+            elif si in masters:
+                f.text = masters[si].translate_formula(ref)[1:]
+            for a in ("t", "si", "ref"):
+                f.attrib.pop(a, None)
+
+
 def apply_row_op(ed, sheet, part, op):
     """Do to ed's copy what Excel does: move the cells, and renumber every
     formula that points at this sheet, on every sheet."""
@@ -918,9 +936,7 @@ def apply_row_op(ed, sheet, part, op):
         sd = root.find(m("sheetData"))
         if sd is None:
             continue
-        for f in list(root.iter(m("f"))):
-            if f.get("t") == "shared" and (f.text or "").strip():
-                ed.unshare(sd, f.get("si"))
+        unshare_all(sd)
         for f in root.iter(m("f")):
             if f.text:
                 f.text = shift_formula(f.text, pname, sheet, op, op.start, op.end)
@@ -944,6 +960,18 @@ def run_rows(path, seed, keep=None):
     """One branch inserts or deletes rows on a sheet; both edit cells."""
     rng = random.Random(f"rows:{seed}:{os.path.basename(path)}")
     res = {"file": str(path), "seed": seed, "mode": "rows"}
+    signal.signal(signal.SIGALRM, _timeout)
+    signal.alarm(TIMEOUT * 3)
+    try:
+        return _run_rows(path, seed, keep, rng, res)
+    except Timeout:
+        res.update(status="fail", reason="check timed out", detail="while preparing the row edit")
+        return res
+    finally:
+        signal.alarm(0)
+
+
+def _run_rows(path, seed, keep, rng, res):
     data = Path(path).read_bytes()
     try:
         base_problems = structural(data, "input")
