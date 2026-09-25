@@ -193,3 +193,14 @@ def test_scrub_merge_report(env, tmp_path):
     z = zipfile.ZipFile(repo / "b-merge-report.zip")
     assert {"base.xlsx", "ours.xlsx", "theirs.xlsx"} <= set(z.namelist())
     assert all(b"Private" not in z.read(n) for n in z.namelist() if n.endswith(".xlsx"))
+
+
+def test_any_characters_reach_git_intact(env, tmp_path):
+    """Windows consoles and pipes default to a code page without most
+    symbols; output must still reach git as UTF-8, never crash."""
+    book(tmp_path / "old.xlsx", {"A1": "plain"})
+    book(tmp_path / "new.xlsx", {"A1": "done \u2713 caf\u00e9 \u6771\u4eac"})
+    r = subprocess.run([sys.executable, str(XLGIT), "diff", str(tmp_path / "old.xlsx"), str(tmp_path / "new.xlsx")],
+                       cwd=tmp_path, env=dict(env, PYTHONIOENCODING="ascii"), capture_output=True)
+    assert r.returncode in (0, 1), r.stderr.decode("utf-8", "replace")
+    assert "done \u2713 caf\u00e9 \u6771\u4eac" in r.stdout.decode("utf-8")

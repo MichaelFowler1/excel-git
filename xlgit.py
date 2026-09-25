@@ -1105,11 +1105,36 @@ def row_map(base_cells, cells):
     if not any(k in ROW_EVENTS for k, *_ in diff_sheet(base_cells, cells)):
         return None
     brows, rows = _by_row(base_cells), _by_row(cells)
-    ro, rn, pairs, lone_old, lone_new, moved = _align(brows, rows, {})
+    cache = {}
+    ro, rn, pairs, lone_old, lone_new, moved = _align(brows, rows, cache)
     # Moved rows count as deleted and inserted: references to them can't be
     # followed the way Excel would, so edits there conflict instead.
     deleted = [ro[i] for i in lone_old] + [ro[i] for i, _ in moved]
-    return RowMap([(ro[i], rn[j]) for i, j in pairs], deleted)
+    rmap = RowMap([(ro[i], rn[j]) for i, j in pairs], deleted)
+    # The alignment is a guess that reads well in a diff; a merge that follows
+    # a wrong guess moves real data. Only trust it when it lines up clearly
+    # more cells with base than leaving every row where it was. A real insert
+    # shifts everything below it and wins easily; a handful of edits on rows
+    # that look alike (same formulas down a column) can't.
+    gain = _row_matches(brows, rows, rmap, cache) - _row_matches(brows, rows, lambda r: r, cache)
+    if gain <= 0:
+        return None
+    return rmap
+
+
+def _row_matches(brows, rows, where, cache):
+    """How many base cells hold the same thing (formulas by shape) at the row
+    `where` puts them."""
+    n = 0
+    for r, cells in brows.items():
+        to = where(r)
+        target = rows.get(to) if to is not None else None
+        if not target:
+            continue
+        for c, v in cells.items():
+            if c in target and _shape(v, r, cache) == _shape(target[c], to, cache):
+                n += 1
+    return n
 
 
 _REF_CELL = re.compile(r"^(\$?)([A-Za-z]{1,3})(\$?)(\d+)$")
@@ -3296,8 +3321,23 @@ def main(argv):
     raise UserError(f"unknown command {cmd!r}. Run `xlgit` to see what it can do.")
 
 
+def _utf8_output():
+    """Cells can hold any language or symbol. Output going to git or a file
+    is UTF-8, which git expects; a console that can't show a character (the
+    Windows default) gets a stand-in instead of a crash."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream.isatty():
+                stream.reconfigure(errors="replace")
+            else:
+                stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def cli():
     """Entry point for the installed `xlgit` command."""
+    _utf8_output()
     try:
         code = main(sys.argv[1:])
     except UserError as e:
