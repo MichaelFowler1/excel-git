@@ -1,8 +1,21 @@
 # xlgit
 
-> Beta (0.1.0). Every release is fuzz-tested against thousands of real-world workbooks, but you'll still find cases it gets wrong. Git keeps every version, so a bad merge can always be undone. Please [open an issue](https://github.com/MichaelFowler1/excel-git/issues) when something looks wrong.
+**Git diff and merge for Excel.** Two people edit the same workbook on their own branches, and git merges it cell by cell. Charts, tables, pivot tables and macros come through intact, and only a cell you both changed is a conflict.
 
-Git and GitHub treat `.xlsx` as an opaque binary blob. You can commit, fork and branch it, but a diff just says "binary file changed" and any merge where both sides touched the file is a conflict. This fixes that.
+![xlgit demo: two estimators edit the same workbook and git merges it](docs/demo.gif)
+
+## Try it in 30 seconds
+
+```bash
+pip install xlgit
+xlgit demo
+```
+
+`xlgit demo` works in a throwaway folder and touches nothing else: Anna inserts a line in a cost estimate, Ben changes a rate and a quantity on his branch, and git merges them, with Ben's edits following their rows down. No Python? Grab the program for your computer from the [latest release](https://github.com/MichaelFowler1/excel-git/releases/latest) and run `xlgit demo` with it.
+
+When you're ready to use it on your own files, run `xlgit install` once. [Get started](#get-started) has the details.
+
+> Beta (0.1.0). Every release is fuzz-tested against thousands of real-world workbooks, but you'll still find cases it gets wrong. Git keeps every version, so a bad merge can always be undone. Please [open an issue](https://github.com/MichaelFowler1/excel-git/issues) when something looks wrong.
 
 ## What you get
 
@@ -111,6 +124,7 @@ xlgit diff OLD NEW           compare any two workbooks (--markdown for a table)
 xlgit diff --html [FILES]    open the changes in your browser (--out=page.html to save it)
 xlgit scrub FILE...          copies with every value made up, safe to attach to a bug report
 xlgit scrub --merge FILE     the three versions of a merge that went wrong, scrubbed, in one zip
+xlgit demo [FOLDER]          two people edit one workbook and git merges it, in a throwaway folder
 xlgit --version
 ```
 
