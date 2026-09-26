@@ -1117,7 +1117,8 @@ def verify_rows(data, obytes, tbytes, merged, mg, sheet, op, known_problems):
             col, r = coordinate_from_string(c)
             r2 = fn(r) if moves else r
             if r2 is None:
-                conflicts.add((name, f"{c} (row deleted)"))
+                if n.get(c) is not None:  # clearing a cell of a row the other side deleted agrees with it
+                    conflicts.add((name, f"{c} (row deleted)"))
                 continue
             tgt = f"{col}{r2}"
             bx, nx, s_now = rw(b.get(c), name), rw(n.get(c), name), sv[name].get(tgt)
