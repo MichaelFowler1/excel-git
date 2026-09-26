@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xlgit"
-version = "0.1.0"
+version = "0.1.1"
 description = "Cell-level diff and merge for Excel workbooks in git, keeping charts, tables and pivots"
 readme = "README.md"
 requires-python = ">=3.9"

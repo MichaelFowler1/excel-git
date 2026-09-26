@@ -29,7 +29,7 @@ from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 from openpyxl.utils.datetime import (CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, from_excel, from_ISO8601,
                                      to_excel)
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 EXTS = ("*.xlsx", "*.xlsm")
 
