@@ -2984,8 +2984,8 @@ jobs:
 """
 
 
-def git(*args, check=True):
-    r = subprocess.run(["git", *args], capture_output=True)
+def git(*args, check=True, cwd=None):
+    r = subprocess.run(["git", *args], capture_output=True, cwd=cwd)
     if check and r.returncode:
         raise UserError(r.stderr.decode(errors="replace").strip() or f"git {' '.join(args)} failed")
     return r.stdout
@@ -3275,13 +3275,13 @@ Help and bug reports: {ISSUES}
 
 # ---------- diff against git ----------
 
-def _git_blob(rev, path):
-    r = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True)
+def _git_blob(rev, path, cwd=None):
+    r = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True, cwd=cwd)
     return r.stdout if r.returncode == 0 else b""
 
 
-def _changed_workbooks(*revs):
-    names = git("diff", "--name-only", "-z", *revs).decode("utf-8", "replace").split("\0")
+def _changed_workbooks(*revs, cwd=None):
+    names = git("diff", "--name-only", "-z", *revs, cwd=cwd).decode("utf-8", "replace").split("\0")
     return [n for n in names if n.lower().endswith((".xlsx", ".xlsm"))]
 
 
@@ -3307,17 +3307,18 @@ def worktree_changes(paths=()):
     root = repo_root()
     if not root:
         raise UserError("not inside a git repository. To compare two files: xlgit diff OLD NEW")
-    abspaths = [os.path.abspath(p) for p in paths]
-    os.chdir(root)
-    has_head = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], capture_output=True).returncode == 0
+    # Run git in the repository root rather than moving there: relative paths
+    # the user gave (--out=page.html) stay relative to where they are.
+    has_head = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], capture_output=True,
+                              cwd=root).returncode == 0
     if paths:
-        files = [os.path.relpath(p, root).replace("\\", "/") for p in abspaths]
+        files = [os.path.relpath(os.path.abspath(p), root).replace("\\", "/") for p in paths]
     else:
-        files = _changed_workbooks("HEAD") if has_head else []
-        untracked = git("ls-files", "--others", "--exclude-standard", "-z").decode("utf-8", "replace").split("\0")
-        files += [n for n in untracked if n.lower().endswith((".xlsx", ".xlsm")) and n not in files]
-    return [(f, _git_blob("HEAD", f) if has_head else b"", open(f, "rb").read() if os.path.exists(f) else b"")
-            for f in files]
+        files = _changed_workbooks("HEAD", cwd=root) if has_head else []
+        untracked = git("ls-files", "--others", "--exclude-standard", "-z", cwd=root).decode("utf-8", "replace")
+        files += [n for n in untracked.split("\0") if n.lower().endswith((".xlsx", ".xlsm")) and n not in files]
+    now = lambda f: open(os.path.join(root, f), "rb").read() if os.path.exists(os.path.join(root, f)) else b""
+    return [(f, _git_blob("HEAD", f, cwd=root) if has_head else b"", now(f)) for f in files]
 
 
 def diff_worktree(paths=()):

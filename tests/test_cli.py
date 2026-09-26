@@ -246,3 +246,19 @@ def test_demo_ignores_the_users_own_git_settings(env, tmp_path):
     r = run(env, tmp_path, "demo", str(tmp_path / "demo"), "--no-open")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "no conflicts" in r.stdout
+
+
+def test_diff_html_out_lands_where_you_are(env, tmp_path):
+    repo = new_repo(env, tmp_path / "repo")
+    sub = repo / "sub"
+    sub.mkdir()
+    book(sub / "b.xlsx", {"A1": "before"})
+    git(env, repo, "add", "-A")
+    git(env, repo, "commit", "-q", "-m", "base")
+    book(sub / "b.xlsx", {"A1": "after"})
+    r = run(env, sub, "diff", "--html", "--out=report.html", "--no-open")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (sub / "report.html").exists() and not (repo / "report.html").exists()
+    assert "after" in (sub / "report.html").read_text(encoding="utf-8")
+    r = run(env, sub, "diff")  # plain diff from a subfolder still finds the change
+    assert "'before' -> 'after'" in r.stdout
