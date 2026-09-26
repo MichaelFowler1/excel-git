@@ -517,6 +517,8 @@ def same(a, b):
         return False
     if a == b:
         return True
+    if type(a) is int and type(b) is int:
+        return False  # whole numbers are exact: IDs and account numbers can run past 15 digits
     return isinstance(a, (int, float)) and isinstance(b, (int, float)) and f"{a:.15g}" == f"{b:.15g}"
 
 

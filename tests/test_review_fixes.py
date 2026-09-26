@@ -24,3 +24,20 @@ def test_array_formulas_follow_a_renamed_table(tmp_path):
     assert result.returncode == 0, result.stderr
     k2 = xlgit.read_cells(str(r.book))["Summary"]["K2"]
     assert isinstance(k2, xlgit.ArrayF) and k2.text == "=SUM(Table3[Y]*2)"
+
+
+def test_long_whole_numbers_are_compared_exactly():
+    assert not xlgit.same(1234567890123456, 1234567890123457)
+    assert xlgit.same(1234567890123456, 1234567890123456)
+    # Excel keeps 15 significant digits, so its copy of the same number still matches.
+    assert xlgit.same(1234567890123456, 1.23456789012346e15)
+    assert xlgit.same(0.1 + 0.2, 0.3)  # float noise between writers still isn't a change
+
+
+def test_a_changed_long_id_survives_the_merge(tmp_path):
+    from test_cell_types import book
+    paths = [str(tmp_path / f"{n}.xlsx") for n in ("base", "ours", "theirs")]
+    for p, ident in zip(paths, (1234567890123456, 1234567890123456, 1234567890123457)):
+        book(p, {"A1": "Account", "B1": ident, "A2": "Owner", "B2": "Ann"})
+    assert xlgit.merge(*paths) == 0
+    assert xlgit.read_cells(paths[1])["Data"]["B1"] == 1234567890123457
