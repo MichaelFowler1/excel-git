@@ -26,7 +26,9 @@ jobs:
           python-version: "3.12"
       - name: Tag matches the version in xlgit.py
         run: |
-          version=$(python -c "import xlgit; print(xlgit.__version__)")
+          # Read it from the file: importing xlgit needs its dependencies,
+          # which aren't installed yet at this point.
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' xlgit.py)
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "::error::Release tag is $GITHUB_REF_NAME but xlgit.__version__ is $version"; exit 1
           fi
