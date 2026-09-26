@@ -126,11 +126,18 @@ def overlaps(a, b):
     return not (a2 < b1 or b2 < a1 or ar2 < br1 or br2 < ar1)
 
 
+_QUOTED = re.compile(r"""('(?:[^']|'')*'|"(?:[^"]|"")*")""")
+
+
 def rename_refs(text, renames):
-    """Point structured references (Table2[Amount], =SUM(Table2)) at renamed tables."""
-    for old, new in renames.items():
-        text = re.sub(rf"(?<![\w.]){re.escape(old)}(?=\[|(?![\w.(!]))", new, text, flags=re.I)
-    return text
+    """Point structured references (Table2[Amount], =SUM(Table2)) at renamed
+    tables. Quoted sheet names ('Table2 notes'!A1) and text ("Table2") are
+    left alone: they only look like the table's name."""
+    parts = _QUOTED.split(text)
+    for i in range(0, len(parts), 2):  # even pieces are outside quotes
+        for old, new in renames.items():
+            parts[i] = re.sub(rf"(?<![\w.]){re.escape(old)}(?=\[|(?![\w.(!]))", new, parts[i], flags=re.I)
+    return "".join(parts)
 
 
 def xdecode(text):
