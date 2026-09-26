@@ -15,7 +15,7 @@ xlgit demo
 
 When you're ready to use it on your own files, run `xlgit install` once. [Get started](#get-started) has the details.
 
-> Beta (0.1.0). Every release is fuzz-tested against thousands of real-world workbooks, but you'll still find cases it gets wrong. Git keeps every version, so a bad merge can always be undone. Please [open an issue](https://github.com/MichaelFowler1/excel-git/issues) when something looks wrong.
+> Beta (0.1.1). Every release is fuzz-tested against thousands of real-world workbooks, but you'll still find cases it gets wrong. Git keeps every version, so a bad merge can always be undone. Please [open an issue](https://github.com/MichaelFowler1/excel-git/issues) when something looks wrong.
 
 ## What you get
 
@@ -152,7 +152,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: MichaelFowler1/excel-git@v0.1.0
+      - uses: MichaelFowler1/excel-git@v0.1.1
 ```
 
 It keeps one comment per pull request up to date as you push. Pull requests from forks can't be commented on with GitHub's default token, so for those the changed cells go in the run's summary page instead.

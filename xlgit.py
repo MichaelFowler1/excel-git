@@ -29,7 +29,7 @@ from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 from openpyxl.utils.datetime import (CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, from_excel, from_ISO8601,
                                      to_excel)
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 EXTS = ("*.xlsx", "*.xlsm")
 
@@ -126,11 +126,18 @@ def overlaps(a, b):
     return not (a2 < b1 or b2 < a1 or ar2 < br1 or br2 < ar1)
 
 
+_QUOTED = re.compile(r"""('(?:[^']|'')*'|"(?:[^"]|"")*")""")
+
+
 def rename_refs(text, renames):
-    """Point structured references (Table2[Amount], =SUM(Table2)) at renamed tables."""
-    for old, new in renames.items():
-        text = re.sub(rf"(?<![\w.]){re.escape(old)}(?=\[|(?![\w.(!]))", new, text, flags=re.I)
-    return text
+    """Point structured references (Table2[Amount], =SUM(Table2)) at renamed
+    tables. Quoted sheet names ('Table2 notes'!A1) and text ("Table2") are
+    left alone: they only look like the table's name."""
+    parts = _QUOTED.split(text)
+    for i in range(0, len(parts), 2):  # even pieces are outside quotes
+        for old, new in renames.items():
+            parts[i] = re.sub(rf"(?<![\w.]){re.escape(old)}(?=\[|(?![\w.(!]))", new, parts[i], flags=re.I)
+    return "".join(parts)
 
 
 def xdecode(text):
@@ -510,6 +517,8 @@ def same(a, b):
         return False
     if a == b:
         return True
+    if type(a) is int and type(b) is int:
+        return False  # whole numbers are exact: IDs and account numbers can run past 15 digits
     return isinstance(a, (int, float)) and isinstance(b, (int, float)) and f"{a:.15g}" == f"{b:.15g}"
 
 
@@ -1752,7 +1761,8 @@ class Merger:
             if rows:
                 col, r = coordinate_from_string(coord)
                 if rows(r) is None:
-                    self.conflict(oname, f"{coord} (row deleted)", bv, "row deleted", tv)
+                    if tv is not None:  # they cleared a cell of a row we deleted: we agree
+                        self.conflict(oname, f"{coord} (row deleted)", bv, "row deleted", tv)
                     continue
                 where = f"{col}{rows(r)}"
             # Compare as if both sides had the row changes.
@@ -1788,7 +1798,7 @@ class Merger:
             sd = etree.SubElement(root, m("sheetData"))
             self.place(root, sd, WS_ORDER)
         self.spell_out_refs(sd)
-        self.unshare_formulas(root, self.oc.get(oname, {}))
+        stuck = self.unshare_formulas(root, self.oc.get(oname, {}))
         # Style numbers index into styles.xml, so theirs only carry over when
         # both branches have the same styles.xml, and only if we didn't restyle.
         their_styles, base_styles = {}, None
@@ -1804,6 +1814,9 @@ class Merger:
             last = int(row.get("r") or last + 1)
             rows[last] = row
         for coord, value in sorted(edits.items(), key=lambda kv: _cell_sort_key(kv[0])):
+            if coord in stuck:  # rewriting it would orphan the rest of its formula group
+                self.conflict(oname, coord, None, "(part of a shared formula)", value)
+                continue
             col, rnum = coordinate_from_string(coord)
             row = self.get_row(sd, rows, rnum)
             row.attrib.pop("spans", None)
@@ -1839,15 +1852,26 @@ class Merger:
 
     def unshare_formulas(self, root, values):
         """Shared formulas are stored once and implied for a range; editing one
-        cell of the range would break the rest, so spell each one out."""
+        cell of the range would break the rest, so spell each one out. A group
+        is only spelled out if every cell in it can be: half a group would leave
+        cells pointing at a formula that's gone, and Excel 'repairs' the file.
+        Returns the cells holding the formula of groups left shared."""
+        groups = {}
         for c in root.iter(m("c")):
             f = c.find(m("f"))
-            if f is not None and f.get("t") == "shared":
-                v = values.get(c.get("r"))
-                if isinstance(v, str) and not isinstance(v, Text) and v.startswith("="):
-                    f.text = v[1:]
-                    for a in ("t", "ref", "si"):
-                        f.attrib.pop(a, None)
+            if f is not None and f.get("t") == "shared" and f.get("si") is not None:
+                groups.setdefault(f.get("si"), []).append((c, f))
+        spelled = lambda v: isinstance(v, str) and not isinstance(v, Text) and v.startswith("=")
+        stuck = set()
+        for members in groups.values():
+            if not all(spelled(values.get(c.get("r"))) for c, _ in members):
+                stuck |= {c.get("r") for c, f in members if (f.text or "").strip()}
+                continue
+            for c, f in members:
+                f.text = values[c.get("r")][1:]
+                for a in ("t", "ref", "si"):
+                    f.attrib.pop(a, None)
+        return stuck
 
     @staticmethod
     def get_row(sd, rows, rnum):
@@ -2099,7 +2123,9 @@ class Merger:
         if self.table_renames:
             for cells in self.tc.values():
                 for coord, v in cells.items():
-                    if isinstance(v, str) and not isinstance(v, Text) and v.startswith("="):
+                    if isinstance(v, ArrayF):
+                        cells[coord] = v._replace(text=rename_refs(v.text, self.table_renames))
+                    elif isinstance(v, str) and not isinstance(v, Text) and v.startswith("="):
                         cells[coord] = rename_refs(v, self.table_renames)
 
     # --- whole sheets ---
@@ -2603,8 +2629,13 @@ def merge(base_path, ours_path, theirs_path, display_path=None):
             f"  Please report this at {ISSUES} so it can be fixed. To share the files safely:\n"
             f"    xlgit scrub --merge \"{name}\"")
         return 1
-    with open(ours_path, "wb") as f:
-        f.write(data)
+    try:
+        with open(ours_path, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        say(f"xlgit merged {name} but couldn't save the result ({e.strerror or e}).\n"
+            f"  If the workbook is open in Excel, close it and run the merge again.")
+        return 1
     took = f"{mg.cells_taken} cell(s)" + (f" and {len(mg.objects_taken)} object(s)" if mg.objects_taken else "")
     if mg.swapped:  # built on their version; the cells written were yours
         took = took.replace("cell(s)", "of your edited cell(s)", 1) + " onto their inserted/deleted rows"
@@ -2973,8 +3004,8 @@ jobs:
 """
 
 
-def git(*args, check=True):
-    r = subprocess.run(["git", *args], capture_output=True)
+def git(*args, check=True, cwd=None):
+    r = subprocess.run(["git", *args], capture_output=True, cwd=cwd)
     if check and r.returncode:
         raise UserError(r.stderr.decode(errors="replace").strip() or f"git {' '.join(args)} failed")
     return r.stdout
@@ -3126,6 +3157,11 @@ def demo(folder=None, open_it=True):
         git("symbolic-ref", "HEAD", "refs/heads/main")
         git("config", "user.name", "xlgit demo")
         git("config", "user.email", "demo@example.invalid")
+        # The user's own git settings mustn't derail the story: fast-forward-only
+        # merges, signed commits and hooks all belong to their real repositories.
+        for key, value in (("merge.ff", "true"), ("commit.gpgsign", "false"),
+                           ("core.hooksPath", os.path.join(root, ".git", "no-hooks"))):
+            git("config", key, value)
         _set_drivers([])  # this repository only
         _add_lines(".gitattributes", ATTR_LINES)
 
@@ -3259,13 +3295,13 @@ Help and bug reports: {ISSUES}
 
 # ---------- diff against git ----------
 
-def _git_blob(rev, path):
-    r = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True)
+def _git_blob(rev, path, cwd=None):
+    r = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True, cwd=cwd)
     return r.stdout if r.returncode == 0 else b""
 
 
-def _changed_workbooks(*revs):
-    names = git("diff", "--name-only", "-z", *revs).decode("utf-8", "replace").split("\0")
+def _changed_workbooks(*revs, cwd=None):
+    names = git("diff", "--name-only", "-z", *revs, cwd=cwd).decode("utf-8", "replace").split("\0")
     return [n for n in names if n.lower().endswith((".xlsx", ".xlsm"))]
 
 
@@ -3291,17 +3327,18 @@ def worktree_changes(paths=()):
     root = repo_root()
     if not root:
         raise UserError("not inside a git repository. To compare two files: xlgit diff OLD NEW")
-    abspaths = [os.path.abspath(p) for p in paths]
-    os.chdir(root)
-    has_head = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], capture_output=True).returncode == 0
+    # Run git in the repository root rather than moving there: relative paths
+    # the user gave (--out=page.html) stay relative to where they are.
+    has_head = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], capture_output=True,
+                              cwd=root).returncode == 0
     if paths:
-        files = [os.path.relpath(p, root).replace("\\", "/") for p in abspaths]
+        files = [os.path.relpath(os.path.abspath(p), root).replace("\\", "/") for p in paths]
     else:
-        files = _changed_workbooks("HEAD") if has_head else []
-        untracked = git("ls-files", "--others", "--exclude-standard", "-z").decode("utf-8", "replace").split("\0")
-        files += [n for n in untracked if n.lower().endswith((".xlsx", ".xlsm")) and n not in files]
-    return [(f, _git_blob("HEAD", f) if has_head else b"", open(f, "rb").read() if os.path.exists(f) else b"")
-            for f in files]
+        files = _changed_workbooks("HEAD", cwd=root) if has_head else []
+        untracked = git("ls-files", "--others", "--exclude-standard", "-z", cwd=root).decode("utf-8", "replace")
+        files += [n for n in untracked.split("\0") if n.lower().endswith((".xlsx", ".xlsm")) and n not in files]
+    now = lambda f: open(os.path.join(root, f), "rb").read() if os.path.exists(os.path.join(root, f)) else b""
+    return [(f, _git_blob("HEAD", f, cwd=root) if has_head else b"", now(f)) for f in files]
 
 
 def diff_worktree(paths=()):

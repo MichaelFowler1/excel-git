@@ -52,7 +52,10 @@ def build_sales(path, rows=ROWS, *, cols=("Region", "Amount"), pivots=(PIVOT,), 
         ws.write_number(r + len(regions) + 1, c + 1, total)
     for sheet, cells in (formulas or {}).items():
         for cell, f in cells.items():
-            sheets[sheet].write_formula(cell, f)
+            if f.startswith("{"):  # an array formula
+                sheets[sheet].write_array_formula(f"{cell}:{cell}", f)
+            else:
+                sheets[sheet].write_formula(cell, f)
     wb.close()
     if pivots:
         add_pivots(path, rows, cols, pivots)
