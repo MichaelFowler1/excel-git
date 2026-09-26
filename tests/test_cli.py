@@ -231,3 +231,18 @@ def test_demo_refuses_a_folder_with_files(env, tmp_path):
     r = run(env, tmp_path, "demo", str(tmp_path / "busy"), "--no-open")
     assert r.returncode == 2 and "isn't empty" in r.stderr
     assert (tmp_path / "busy" / "keep.txt").read_text() == "mine"
+
+
+def test_demo_ignores_the_users_own_git_settings(env, tmp_path):
+    """Fast-forward-only merges, signed commits and hooks set globally are
+    the user's business; the demo's throwaway repository shouldn't trip on them."""
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    (hooks / "pre-commit").write_text("#!/bin/sh\nexit 1\n")
+    (hooks / "pre-commit").chmod(0o755)
+    settings = {"merge.ff": "only", "commit.gpgsign": "true", "core.hooksPath": str(hooks)}
+    for k, v in settings.items():  # in the (test's own) global ~/.gitconfig, where users keep them
+        git(env, tmp_path, "config", "--global", k, v)
+    r = run(env, tmp_path, "demo", str(tmp_path / "demo"), "--no-open")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "no conflicts" in r.stdout

@@ -3126,6 +3126,11 @@ def demo(folder=None, open_it=True):
         git("symbolic-ref", "HEAD", "refs/heads/main")
         git("config", "user.name", "xlgit demo")
         git("config", "user.email", "demo@example.invalid")
+        # The user's own git settings mustn't derail the story: fast-forward-only
+        # merges, signed commits and hooks all belong to their real repositories.
+        for key, value in (("merge.ff", "true"), ("commit.gpgsign", "false"),
+                           ("core.hooksPath", os.path.join(root, ".git", "no-hooks"))):
+            git("config", key, value)
         _set_drivers([])  # this repository only
         _add_lines(".gitattributes", ATTR_LINES)
 
