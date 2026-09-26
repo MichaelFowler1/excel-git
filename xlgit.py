@@ -2106,7 +2106,9 @@ class Merger:
         if self.table_renames:
             for cells in self.tc.values():
                 for coord, v in cells.items():
-                    if isinstance(v, str) and not isinstance(v, Text) and v.startswith("="):
+                    if isinstance(v, ArrayF):
+                        cells[coord] = v._replace(text=rename_refs(v.text, self.table_renames))
+                    elif isinstance(v, str) and not isinstance(v, Text) and v.startswith("="):
                         cells[coord] = rename_refs(v, self.table_renames)
 
     # --- whole sheets ---
