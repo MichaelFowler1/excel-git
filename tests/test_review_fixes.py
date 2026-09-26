@@ -117,3 +117,18 @@ def test_a_shared_formula_group_is_never_left_half_spelled_out(tmp_path, monkeyp
              (("base", "A1*2"), ("ours", "A1*2"), ("theirs", "A1*3"))]
     assert xlgit.merge(*paths) == 1
     assert _group_intact(paths[1])
+
+
+def test_a_result_that_cant_be_saved_says_so_plainly(tmp_path, capsys):
+    import os
+    import stat
+    from test_cell_types import book
+    paths = [book(tmp_path / f"{n}.xlsx", {"A1": v}) or str(tmp_path / f"{n}.xlsx")
+             for n, v in (("base", "a"), ("ours", "a"), ("theirs", "b"))]
+    os.chmod(paths[1], stat.S_IREAD)  # stands in for a file something else holds open
+    try:
+        assert xlgit.merge(*paths) == 1
+    finally:
+        os.chmod(paths[1], stat.S_IREAD | stat.S_IWRITE)
+    err = capsys.readouterr().err
+    assert "couldn't save the result" in err and "close it and run the merge again" in err

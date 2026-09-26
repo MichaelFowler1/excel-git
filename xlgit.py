@@ -2629,8 +2629,13 @@ def merge(base_path, ours_path, theirs_path, display_path=None):
             f"  Please report this at {ISSUES} so it can be fixed. To share the files safely:\n"
             f"    xlgit scrub --merge \"{name}\"")
         return 1
-    with open(ours_path, "wb") as f:
-        f.write(data)
+    try:
+        with open(ours_path, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        say(f"xlgit merged {name} but couldn't save the result ({e.strerror or e}).\n"
+            f"  If the workbook is open in Excel, close it and run the merge again.")
+        return 1
     took = f"{mg.cells_taken} cell(s)" + (f" and {len(mg.objects_taken)} object(s)" if mg.objects_taken else "")
     if mg.swapped:  # built on their version; the cells written were yours
         took = took.replace("cell(s)", "of your edited cell(s)", 1) + " onto their inserted/deleted rows"
