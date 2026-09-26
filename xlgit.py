@@ -3016,23 +3016,27 @@ def _remove_lines(path, lines):
             f.write("".join(ln + "\n" for ln in kept))
 
 
-def install(scope="global"):
+def _set_drivers(where):
+    """Point git's diff and merge drivers for workbooks at this program."""
     if getattr(sys, "frozen", False):  # the standalone download: git runs the program itself
         cmd = '"' + sys.executable.replace("\\", "/") + '"'
     else:
         here = os.path.abspath(__file__).replace("\\", "/")
         py = sys.executable.replace("\\", "/")
         cmd = f'"{py}" "{here}"'
-    where = ["--global"] if scope == "global" else []
-    root = repo_root()
-    if scope == "repo" and not root:
-        raise UserError("this folder isn't inside a git repository. Run it inside one, "
-                        "or run `xlgit install` to set up every repository on this computer.")
     for key, value in (("diff.xlsx.textconv", f"{cmd} textconv"), ("diff.xlsx.binary", "true"),
                        ("diff.xlsx.command", f"{cmd} gitdiff"),
                        ("merge.xlsx.name", "xlgit cell-level merge"),
                        ("merge.xlsx.driver", f"{cmd} merge %O %A %B %P")):
         git("config", *where, key, value)
+
+
+def install(scope="global"):
+    root = repo_root()
+    if scope == "repo" and not root:
+        raise UserError("this folder isn't inside a git repository. Run it inside one, "
+                        "or run `xlgit install` to set up every repository on this computer.")
+    _set_drivers(["--global"] if scope == "global" else [])
     if scope == "global":
         _add_lines(global_attributes_file(), ATTR_LINES)
         print("xlgit is set up for every git repository on this computer.\n"
@@ -3063,6 +3067,125 @@ def install_github():
           f"    git commit -m \"Show Excel changes on pull requests\"\n"
           f"    git push\n"
           f"  Every pull request that changes a workbook then gets a comment listing the changed cells.")
+
+
+# ---------- demo ----------
+
+DEMO_TRADES = [("Concrete", "m3", 120, 185), ("Framing", "m2", 2400, 6.5), ("Electrical", "m2", 2400, 4.25),
+               ("Plumbing", "fixture", 18, 950), ("Finishes", "m2", 2400, 12)]
+
+
+def _demo_book(path, trades):
+    """A small cost estimate with a total and a chart, built the same way
+    every time so the versions differ only where the story says."""
+    from openpyxl import Workbook
+    from openpyxl.chart import BarChart, Reference
+    from openpyxl.styles import Font
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Estimate"
+    ws.append(["Trade", "Unit", "Qty", "Rate", "Amount"])
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for r, (trade, unit, qty, rate) in enumerate(trades, start=2):
+        ws.append([trade, unit, qty, rate, f"=C{r}*D{r}"])
+        ws[f"E{r}"].number_format = '"$"#,##0'
+    total = len(trades) + 2
+    ws[f"A{total}"] = "Total"
+    ws[f"A{total}"].font = Font(bold=True)
+    ws[f"E{total}"] = f"=SUM(E2:E{total - 1})"
+    ws[f"E{total}"].number_format = '"$"#,##0'
+    ws[f"E{total}"].font = Font(bold=True)
+    ws.column_dimensions["A"].width = 14
+    chart = BarChart()
+    chart.title = "Cost by trade"
+    chart.legend = None
+    chart.add_data(Reference(ws, min_col=5, min_row=1, max_row=total - 1), titles_from_data=True)
+    chart.set_categories(Reference(ws, min_col=1, min_row=2, max_row=total - 1))
+    ws.add_chart(chart, "G2")
+    wb.save(path)
+
+
+def demo(folder=None, open_it=True):
+    """Two estimators edit the same workbook on their own branches, and git
+    merges them, in a throwaway repository. Nothing outside it is touched."""
+    import shutil
+    import tempfile
+    if not shutil.which("git"):
+        raise UserError("the demo needs git. Install it from https://git-scm.com and run `xlgit demo` again.")
+    if folder:
+        if os.path.exists(folder) and os.listdir(folder):
+            raise UserError(f"{folder} isn't empty. Pick a new folder, or run `xlgit demo` without one.")
+        os.makedirs(folder, exist_ok=True)
+    root = os.path.abspath(folder or tempfile.mkdtemp(prefix="xlgit-demo-"))
+    book = "estimate.xlsx"
+    here = os.getcwd()
+    os.chdir(root)
+    try:
+        git("init", "-q")
+        git("symbolic-ref", "HEAD", "refs/heads/main")
+        git("config", "user.name", "xlgit demo")
+        git("config", "user.email", "demo@example.invalid")
+        _set_drivers([])  # this repository only
+        _add_lines(".gitattributes", ATTR_LINES)
+
+        def commit(msg, trades):
+            _demo_book(book, trades)
+            git("add", "-A")
+            git("commit", "-q", "-m", msg)
+
+        def show(*args):
+            out = git(*args).decode(errors="replace").rstrip()
+            for line in out.splitlines():
+                print("    " + line)
+
+        print(f"A throwaway repository in {root}\n")
+        print("1. Anna and Ben share estimate.xlsx: five trades, a total and a chart.")
+        commit("Estimate for bid", DEMO_TRADES)
+
+        roofing = ("Roofing", "m2", 1100, 38)
+        anna = DEMO_TRADES[:2] + [roofing] + DEMO_TRADES[2:]
+        git("checkout", "-q", "-b", "anna")
+        commit("Add roofing", anna)
+        print("\n2. Anna inserts a Roofing line on her branch. git diff main anna:")
+        show("--no-pager", "diff", "main", "anna", "--", book)
+
+        ben = [(t, u, 22 if t == "Plumbing" else q, 4.6 if t == "Electrical" else r) for t, u, q, r in DEMO_TRADES]
+        git("checkout", "-q", "main")
+        git("checkout", "-q", "-b", "ben")
+        commit("New electrical rate, more fixtures", ben)
+        print("\n3. Meanwhile Ben updates two numbers on his branch. git diff main ben:")
+        show("--no-pager", "diff", "main", "ben", "--", book)
+
+        print("\n4. Anna merges Ben's branch. Without xlgit this is a conflict on the whole file:")
+        git("checkout", "-q", "anna")
+        r = subprocess.run(["git", "merge", "--no-edit", "ben"], capture_output=True, text=True)
+        for line in (r.stdout + r.stderr).splitlines():
+            if line.strip():
+                print("    " + line.strip())
+        if r.returncode:
+            raise UserError("the demo merge didn't go through cleanly, which it should. Please report it: " + ISSUES)
+
+        cells = read_cells(book)["Estimate"]
+        print("\n5. The merged estimate has both people's work. Ben's edits followed their rows down:")
+        for row in range(2, len(anna) + 2):
+            trade, qty, rate = cells.get(f"A{row}"), cells.get(f"C{row}"), cells.get(f"D{row}")
+            note = {"Roofing": "   <- Anna", "Electrical": "   <- Ben's rate", "Plumbing": "   <- Ben's qty"}.get(trade, "")
+            print(f"    row {row}  {trade:<11} qty {qty:>5}  rate {rate:>6}{note}")
+        before = sum(q * r for _, _, q, r in DEMO_TRADES)
+        after = sum(cells[f"C{row}"] * cells[f"D{row}"] for row in range(2, len(anna) + 2))
+        print(f"    row {len(anna) + 2}  Total       {cells.get(f'E{len(anna) + 2}')}   "
+              f"= ${after:,.0f} when Excel calculates it (was ${before:,.0f})")
+        print("    The chart came through too. Open estimate.xlsx to see it.")
+
+        print("\n6. The whole change as a grid, in your browser:")
+        page = os.path.join(root, "changes.html")
+        write_html([(book, Package(_git_blob("main", book)), Package.open(book))], page, open_it=open_it)
+        print(f"\nPoke around in {root}: git log, xlgit diff, or open estimate.xlsx in Excel.\n"
+              "To use xlgit on your own files, run `xlgit install` once.")
+    finally:
+        os.chdir(here)
+    return root
 
 
 def uninstall(scope="global"):
@@ -3106,6 +3229,9 @@ def status_lines():
 
 HELP = f"""\
 xlgit {__version__}: see and merge changes inside Excel files with git.
+
+Try it (30 seconds, in a throwaway folder):
+  xlgit demo                 two people edit one workbook, git merges it
 
 Set up (once per computer):
   xlgit install              git diff and git merge understand .xlsx/.xlsm in every repository
@@ -3292,6 +3418,9 @@ def main(argv):
             install_github()
         else:
             install("repo" if "--repo" in flags else "global")
+        return 0
+    if cmd == "demo":
+        demo(args[0] if args else None, open_it="--no-open" not in flags)
         return 0
     if cmd == "uninstall":
         uninstall("repo" if "--repo" in flags else "global")

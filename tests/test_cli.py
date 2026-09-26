@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import xlgit
 from test_cell_types import book
 
 XLGIT = Path(__file__).resolve().parents[1] / "xlgit.py"
@@ -204,3 +205,29 @@ def test_any_characters_reach_git_intact(env, tmp_path):
                        cwd=tmp_path, env=dict(env, PYTHONIOENCODING="ascii"), capture_output=True)
     assert r.returncode in (0, 1), r.stderr.decode("utf-8", "replace")
     assert "done \u2713 caf\u00e9 \u6771\u4eac" in r.stdout.decode("utf-8")
+
+
+def test_demo_merges_both_estimators(env, tmp_path):
+    folder = tmp_path / "demo"
+    r = run(env, tmp_path, "demo", str(folder), "--no-open")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "took 2 cell(s) from the other branch, no conflicts" in r.stdout
+    assert "$140,340" in r.stdout and "$93,900" in r.stdout
+    cells = xlgit.read_cells(str(folder / "estimate.xlsx"))["Estimate"]
+    assert cells["A4"] == "Roofing"                      # Anna's inserted line
+    assert cells["A5"] == "Electrical" and cells["D5"] == 4.6  # Ben's rate, moved down a row
+    assert cells["A6"] == "Plumbing" and cells["C6"] == 22     # Ben's quantity
+    assert cells["E8"] == "=SUM(E2:E7)"
+    assert any(o.startswith("chart:") for o in xlgit.describe_objects(
+        xlgit.Package.open(str(folder / "estimate.xlsx")))["Estimate"])
+    assert (folder / "changes.html").exists()
+    # The demo stays inside its folder: the real global git config is untouched.
+    assert not os.path.exists(env["GIT_CONFIG_GLOBAL"]) or "xlsx" not in Path(env["GIT_CONFIG_GLOBAL"]).read_text()
+
+
+def test_demo_refuses_a_folder_with_files(env, tmp_path):
+    (tmp_path / "busy").mkdir()
+    (tmp_path / "busy" / "keep.txt").write_text("mine")
+    r = run(env, tmp_path, "demo", str(tmp_path / "busy"), "--no-open")
+    assert r.returncode == 2 and "isn't empty" in r.stderr
+    assert (tmp_path / "busy" / "keep.txt").read_text() == "mine"
