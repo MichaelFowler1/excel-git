@@ -41,3 +41,17 @@ def test_a_changed_long_id_survives_the_merge(tmp_path):
         book(p, {"A1": "Account", "B1": ident, "A2": "Owner", "B2": "Ann"})
     assert xlgit.merge(*paths) == 0
     assert xlgit.read_cells(paths[1])["Data"]["B1"] == 1234567890123457
+
+
+def test_clearing_a_cell_in_a_row_the_other_side_deleted_is_no_clash(tmp_path):
+    from test_rows import BASE, budget
+    for who_deletes in ("ours", "theirs"):
+        d = tmp_path / who_deletes
+        d.mkdir()
+        deleted = BASE[:1] + BASE[2:]                                     # Food row gone
+        cleared = [(n, None if n == "Food" else a, b) for n, a, b in BASE]  # Food's Q1 emptied
+        ours, theirs = (deleted, cleared) if who_deletes == "ours" else (cleared, deleted)
+        paths = [budget(d / f"{n}.xlsx", rows) for n, rows in (("base", BASE), ("ours", ours), ("theirs", theirs))]
+        assert xlgit.merge(*paths) == 0, who_deletes
+        cells = xlgit.read_cells(paths[1])["Budget"]
+        assert "Food" not in cells.values() and cells["A3"] == "Power"

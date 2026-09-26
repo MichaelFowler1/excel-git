@@ -1761,7 +1761,8 @@ class Merger:
             if rows:
                 col, r = coordinate_from_string(coord)
                 if rows(r) is None:
-                    self.conflict(oname, f"{coord} (row deleted)", bv, "row deleted", tv)
+                    if tv is not None:  # they cleared a cell of a row we deleted: we agree
+                        self.conflict(oname, f"{coord} (row deleted)", bv, "row deleted", tv)
                     continue
                 where = f"{col}{rows(r)}"
             # Compare as if both sides had the row changes.
