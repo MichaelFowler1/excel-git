@@ -2,7 +2,9 @@
 
 **Git diff and merge for Excel.** Two people edit the same workbook on their own branches, and git merges it cell by cell. Charts, tables, pivot tables and macros come through intact, and only a cell you both changed is a conflict.
 
-![xlgit demo: two estimators edit the same workbook and git merges it](docs/demo.gif)
+Other Excel version control tools show you what changed and then leave the merging to you, by hand. As far as I know, xlgit is the only free, open-source tool that merges two versions of a workbook automatically and keeps everything in it working. [How it compares](#how-it-compares) has the details.
+
+![xlgit demo: two estimators edit the same workbook and git merges it](https://raw.githubusercontent.com/MichaelFowler1/excel-git/main/docs/demo.gif)
 
 ## Try it in 30 seconds
 
@@ -15,7 +17,7 @@ xlgit demo
 
 When you're ready to use it on your own files, run `xlgit install` once. [Get started](#get-started) has the details.
 
-> Beta (0.1.1). Every release is fuzz-tested against thousands of real-world workbooks, but you'll still find cases it gets wrong. Git keeps every version, so a bad merge can always be undone. Please [open an issue](https://github.com/MichaelFowler1/excel-git/issues) when something looks wrong.
+> Beta (0.1.1). The merge has been fuzz-tested against about 3,000 real-world workbooks, but you'll still find cases it gets wrong. Git keeps every version, so a bad merge can always be undone. Please [open an issue](https://github.com/MichaelFowler1/excel-git/issues) when something looks wrong.
 
 ## What you get
 
@@ -31,6 +33,30 @@ When you're ready to use it on your own files, run `xlgit install` once. [Get st
 | Pull request on GitHub | "binary file not shown" | bot comment with a table of every changed cell, chart, table and pivot |
 
 Formulas are compared as formulas (`=B2+C2`), not their cached results.
+
+## How it compares
+
+People have wanted this for a long time, and there are good tools that get part of the way. Here's where each one stops:
+
+| | Shows what changed | Merges two versions automatically | Keeps charts, tables, pivots | Free and open source |
+|---|---|---|---|---|
+| **xlgit** | cells, rows, charts, tables, pivots | yes, cell by cell | yes | yes (Apache-2.0) |
+| [xltrail](https://www.xltrail.com/) | yes | no: its own guide merges by copying changes across by hand | n/a | no, paid |
+| [xlCompare](https://xlcompare.com/) | yes | no: you pick each change in a side-by-side window | n/a | no, paid (Windows) |
+| [Git XL](https://github.com/xltrail/git-xl) | VBA macro code only | no | n/a | yes |
+| [daff](https://github.com/paulfitz/daff) | yes, for tables | yes, but for CSV files, not workbooks | no (CSV has none) | yes |
+| [exceldiff](https://github.com/MinamiyamaKotaro/exceldiff) | yes, as pull request comments | no | n/a | yes (AGPL) |
+| Excel co-authoring (OneDrive, SharePoint) | version history | no branches: everyone edits one live copy | yes | no, part of Microsoft 365 |
+
+Checked in September 2026 against each tool's own documentation. If something here is wrong or out of date, please [open an issue](https://github.com/MichaelFowler1/excel-git/issues) and it'll be fixed.
+
+Co-authoring is great when a team can edit one copy at the same time. xlgit is for when they can't or shouldn't: work on separate copies or branches, review the change, then merge it.
+
+### Why it's hard, and how xlgit does it
+
+A workbook isn't one file. It's a zip of dozens of XML parts that point at each other, and Excel renumbers them every time it saves. A merge that re-saves the workbook through a spreadsheet library quietly drops the charts and pivots that library doesn't understand, which is why automatic merging has been left alone. xlgit works on the XML directly: it starts from your copy, matches objects between versions by what they are rather than their file names, and only rewrites the parts that changed. [How the merge works](#how-the-merge-works) goes into detail.
+
+It's tested the hard way: 69 automated tests on Windows, macOS and Linux, and a fuzzer that makes random edits to real-world workbooks on two branches, merges them and checks nothing was lost. It has run over about 3,000 of them so far, from the Enron corpus and other spreadsheet libraries' test files, and every bug it found is fixed.
 
 ## Get started
 
@@ -192,12 +218,12 @@ python fuzz/merge_fuzz.py corpus --keep failed/
 
 ## Roadmap
 
-Next up: testing against thousands of real workbooks, understanding inserted and moved rows, then code review for spreadsheets: showing what a change does to the numbers, tests that run on every pull request, and a linter. See [ROADMAP.md](ROADMAP.md).
+Done so far: fuzz testing against real workbooks and following inserted, deleted and moved rows. Next up: code review for spreadsheets: showing what a change does to the numbers, tests that run on every pull request, and a linter. See [ROADMAP.md](https://github.com/MichaelFowler1/excel-git/blob/main/ROADMAP.md).
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](https://github.com/MichaelFowler1/excel-git/blob/main/LICENSE).
 
-You can use, change and ship xlgit, including commercially. If you pass it on, modified or not, keep the [NOTICE](NOTICE) file and the copyright line at the top of `xlgit.py` with it. The license doesn't grant use of the xlgit name for your own version.
+You can use, change and ship xlgit, including commercially. If you pass it on, modified or not, keep the [NOTICE](https://github.com/MichaelFowler1/excel-git/blob/main/NOTICE) file and the copyright line at the top of `xlgit.py` with it. The license doesn't grant use of the xlgit name for your own version.
 
 Created by Michael Fowler.
