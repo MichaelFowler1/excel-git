@@ -55,3 +55,65 @@ def test_clearing_a_cell_in_a_row_the_other_side_deleted_is_no_clash(tmp_path):
         assert xlgit.merge(*paths) == 0, who_deletes
         cells = xlgit.read_cells(paths[1])["Budget"]
         assert "Food" not in cells.values() and cells["A3"] == "Power"
+
+
+def _shared_group_book(path, extra=None, b1="A1*2"):
+    """B1:B3 as one shared formula group (=A1*2 filled down), the way Excel
+    stores it. extra: {cell: number} added in column C."""
+    import re
+    import zipfile
+    import xlsxwriter
+    wb = xlsxwriter.Workbook(str(path))
+    ws = wb.add_worksheet("Data")
+    for r in range(3):
+        ws.write_number(r, 0, r + 1)
+        ws.write_formula(r, 1, f"=A{r + 1}*2")
+    for ref, v in (extra or {}).items():
+        ws.write_number(ref, v)
+    wb.close()
+    with zipfile.ZipFile(path) as z:
+        parts = {n: z.read(n) for n in z.namelist()}
+    xml = parts["xl/worksheets/sheet1.xml"].decode()
+    xml = re.sub(r'<c r="B1"([^>]*)><f>[^<]*</f>', rf'<c r="B1"\1><f t="shared" ref="B1:B3" si="0">{b1}</f>', xml)
+    for ref in ("B2", "B3"):
+        xml = re.sub(rf'<c r="{ref}"([^>]*)><f>[^<]*</f>', rf'<c r="{ref}"\1><f t="shared" si="0"/>', xml)
+    parts["xl/worksheets/sheet1.xml"] = xml.encode()
+    with zipfile.ZipFile(path, "w") as z:
+        for n, d in parts.items():
+            z.writestr(n, d)
+    return str(path)
+
+
+def _group_intact(path):
+    """Every cell pointing at a shared formula group still has the group's formula cell."""
+    pkg = xlgit.Package.open(path)
+    root = pkg.xml("xl/worksheets/sheet1.xml")
+    masters, children = set(), set()
+    for f in root.iter(xlgit.m("f")):
+        if f.get("t") == "shared":
+            (masters if (f.text or "").strip() else children).add(f.get("si"))
+    return children <= masters
+
+
+def test_a_shared_formula_group_is_never_left_half_spelled_out(tmp_path, monkeypatch):
+    class Stubborn(xlgit.Translator):  # this one cell's formula can't be worked out
+        def translate_formula(self, dest=None, row_delta=0, col_delta=0):
+            if dest == "B3":
+                raise ValueError("can't translate")
+            return super().translate_formula(dest, row_delta, col_delta)
+    monkeypatch.setattr(xlgit, "Translator", Stubborn)
+
+    # Their edit elsewhere on the sheet: the group has to stay whole.
+    paths = [_shared_group_book(tmp_path / f"{n}.xlsx", extra) for n, extra in
+             (("base", None), ("ours", None), ("theirs", {"C1": 7}))]
+    assert xlgit.merge(*paths) == 0
+    assert _group_intact(paths[1])
+    assert xlgit.read_cells(paths[1])["Data"]["C1"] == 7
+
+    # Their edit to the group's formula cell itself: reported, not written half-way.
+    d = tmp_path / "master"
+    d.mkdir()
+    paths = [_shared_group_book(d / f"{n}.xlsx", b1=f) for n, f in
+             (("base", "A1*2"), ("ours", "A1*2"), ("theirs", "A1*3"))]
+    assert xlgit.merge(*paths) == 1
+    assert _group_intact(paths[1])

@@ -1798,7 +1798,7 @@ class Merger:
             sd = etree.SubElement(root, m("sheetData"))
             self.place(root, sd, WS_ORDER)
         self.spell_out_refs(sd)
-        self.unshare_formulas(root, self.oc.get(oname, {}))
+        stuck = self.unshare_formulas(root, self.oc.get(oname, {}))
         # Style numbers index into styles.xml, so theirs only carry over when
         # both branches have the same styles.xml, and only if we didn't restyle.
         their_styles, base_styles = {}, None
@@ -1814,6 +1814,9 @@ class Merger:
             last = int(row.get("r") or last + 1)
             rows[last] = row
         for coord, value in sorted(edits.items(), key=lambda kv: _cell_sort_key(kv[0])):
+            if coord in stuck:  # rewriting it would orphan the rest of its formula group
+                self.conflict(oname, coord, None, "(part of a shared formula)", value)
+                continue
             col, rnum = coordinate_from_string(coord)
             row = self.get_row(sd, rows, rnum)
             row.attrib.pop("spans", None)
@@ -1849,15 +1852,26 @@ class Merger:
 
     def unshare_formulas(self, root, values):
         """Shared formulas are stored once and implied for a range; editing one
-        cell of the range would break the rest, so spell each one out."""
+        cell of the range would break the rest, so spell each one out. A group
+        is only spelled out if every cell in it can be: half a group would leave
+        cells pointing at a formula that's gone, and Excel 'repairs' the file.
+        Returns the cells holding the formula of groups left shared."""
+        groups = {}
         for c in root.iter(m("c")):
             f = c.find(m("f"))
-            if f is not None and f.get("t") == "shared":
-                v = values.get(c.get("r"))
-                if isinstance(v, str) and not isinstance(v, Text) and v.startswith("="):
-                    f.text = v[1:]
-                    for a in ("t", "ref", "si"):
-                        f.attrib.pop(a, None)
+            if f is not None and f.get("t") == "shared" and f.get("si") is not None:
+                groups.setdefault(f.get("si"), []).append((c, f))
+        spelled = lambda v: isinstance(v, str) and not isinstance(v, Text) and v.startswith("=")
+        stuck = set()
+        for members in groups.values():
+            if not all(spelled(values.get(c.get("r"))) for c, _ in members):
+                stuck |= {c.get("r") for c, f in members if (f.text or "").strip()}
+                continue
+            for c, f in members:
+                f.text = values[c.get("r")][1:]
+                for a in ("t", "ref", "si"):
+                    f.attrib.pop(a, None)
+        return stuck
 
     @staticmethod
     def get_row(sd, rows, rnum):
