@@ -248,12 +248,12 @@ def test_diff_reports_chart_changes(tmp_path, capsys):
     build(tmp_path / "b.xlsx", **ALICE)
     xlgit.diff(str(tmp_path / "a.xlsx"), str(tmp_path / "b.xlsx"))
     out = capsys.readouterr().out
-    assert "changed        Budget!B2  1000 -> 1100" in out
+    assert "changed         Budget!B2  1000 -> 1100" in out
     # the retitled chart is one change, not a removal plus an addition
-    assert "object changed Budget  chart: barChart 'Spending'" in out and "-> chart: barChart 'Spending 2026'" in out
-    assert "object removed Budget" not in out and "object added   Budget" not in out
+    assert "object changed  Budget  chart: barChart 'Spending'" in out and "-> chart: barChart 'Spending 2026'" in out
+    assert "object removed  Budget" not in out and "object added    Budget" not in out
     # the renamed sheet is a rename, with nothing else about it changed
-    assert "sheet renamed  Notes -> Notes 2026" in out
+    assert "sheet renamed   Notes -> Notes 2026" in out
     assert "Notes 2026!" not in out and "comment" not in out
 
 
