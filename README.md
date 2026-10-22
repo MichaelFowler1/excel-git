@@ -23,10 +23,10 @@ When you're ready to use it on your own files, run `xlgit install` once. [Get st
 
 | | Without xlgit | With xlgit |
 |---|---|---|
-| `git diff` | `Binary files differ` | `changed Budget!B2 1000 -> 1100`, plus inserted, deleted and moved rows, and chart, image and comment changes |
+| `git diff` | `Binary files differ` | `changed Budget!B2 1000 -> 1100`, plus inserted, deleted and moved rows and columns, and chart, image and comment changes |
 | Seeing changes | n/a | `xlgit diff --html`: the sheet as a grid in your browser, changes highlighted |
 | Merge, different cells edited | conflict, pick one whole file | merges cleanly |
-| Merge, one side inserted rows | conflict | the other side's edits follow their rows |
+| Merge, one side inserted rows or columns | conflict | the other side's edits follow their rows and columns |
 | Merge, same cell edited | conflict | conflict on just that cell, listed in a `_merge_conflicts` sheet with a link to it |
 | Charts, images, comments, formatting, macros | n/a | kept, and their edits to them carried over |
 | Tables and pivot tables | n/a | merged: you add rows, they add a column, you get both |
@@ -40,7 +40,7 @@ People have wanted this for a long time, and there are good tools that get part 
 
 | | Shows what changed | Merges two versions automatically | Keeps charts, tables, pivots | Free and open source |
 |---|---|---|---|---|
-| **xlgit** | cells, rows, charts, tables, pivots | yes, cell by cell | yes | yes (Apache-2.0) |
+| **xlgit** | cells, rows, columns, charts, tables, pivots | yes, cell by cell | yes | yes (Apache-2.0) |
 | [xltrail](https://www.xltrail.com/) | yes | no: its own guide merges by copying changes across by hand | n/a | no, paid |
 | [xlCompare](https://xlcompare.com/) | yes | no: you pick each change in a side-by-side window | n/a | no, paid (Windows) |
 | [Git XL](https://github.com/xltrail/git-xl) | VBA macro code only | no | n/a | yes |
@@ -56,7 +56,7 @@ Co-authoring is great when a team can edit one copy at the same time. xlgit is f
 
 A workbook isn't one file. It's a zip of dozens of XML parts that point at each other, and Excel renumbers them every time it saves. A merge that re-saves the workbook through a spreadsheet library quietly drops the charts and pivots that library doesn't understand, which is why automatic merging has been left alone. xlgit works on the XML directly: it starts from your copy, matches objects between versions by what they are rather than their file names, and only rewrites the parts that changed. [How the merge works](#how-the-merge-works) goes into detail.
 
-It's tested the hard way: 69 automated tests on Windows, macOS and Linux, and a fuzzer that makes random edits to real-world workbooks on two branches, merges them and checks nothing was lost. It has run over about 3,000 of them so far, from the Enron corpus and other spreadsheet libraries' test files, and every bug it found is fixed.
+It's tested the hard way: 101 automated tests on Windows, macOS and Linux, and a fuzzer that makes random edits to real-world workbooks on two branches, merges them and checks nothing was lost. It has run over about 3,000 of them so far, from the Enron corpus and other spreadsheet libraries' test files, and every bug it found is fixed.
 
 ## Get started
 
@@ -83,14 +83,21 @@ Run `xlgit` on its own at any time to see the commands and check that everything
 
 ## Everyday use
 
-**See what changed.** `xlgit diff` lists every cell that changed in your workbooks since the last commit. Inserted, deleted and moved rows show up as rows, not as every cell below them changing. `git diff`, `git log -p` and `git show` show cell changes too.
+**See what changed.** `xlgit diff` lists every cell that changed in your workbooks since the last commit. Inserted, deleted and moved rows show up as rows, not as every cell below them changing, and columns the same way. `git diff`, `git log -p` and `git show` show cell changes too.
 
 ```
 $ xlgit diff
 === budget.xlsx ===
-changed        Budget!C3  350 -> 999
-row inserted   Budget row 4  A: 'Gas', B: 60, C: 70, D: =B4+C4
-changed        Budget!D8  =SUM(D2:D6) -> =SUM(D2:D7)
+changed         Budget!C3  350 -> 999
+row inserted    Budget row 4  A: 'Gas', B: 60, C: 70, D: =B4+C4
+changed         Budget!D8  =SUM(D2:D6) -> =SUM(D2:D7)
+```
+
+A column inserted on the next commit, say a Q3 between Q2 and Total, reads the same way:
+
+```
+column inserted Budget column D  D1: 'Q3', D2: 1050, D3: 380, D4: 85, D5: 40, D6: 230
+changed         Budget!E2  =B2+C2 -> =B2+C2+D2
 ```
 
 `xlgit diff --html` opens the same changes in your browser, laid out like the spreadsheet:
@@ -125,7 +132,7 @@ xlgit scrub old.xlsx new.xlsx       # any workbooks, e.g. for a wrong diff
 A workbook is a zip of XML files: one per sheet, one per chart, one per image and so on. Instead of re-saving the whole thing through a spreadsheet library (which is how charts used to get lost), xlgit starts from your copy's zip and only rewrites the XML that has to change:
 
 - **Cells**: 3-way merge cell by cell. A cell only one side changed takes that side's value.
-- **Rows**: if one branch inserted, deleted or moved rows and the other edited cells, the edits land on the rows where their cells ended up, with formula references renumbered the way Excel does it. An edit to a row the other branch deleted is a conflict.
+- **Rows and columns**: if one branch inserted, deleted or moved rows (or columns) and the other edited cells, the edits land on the rows (columns) where their cells ended up, with formula references, named ranges and table ranges renumbered the way Excel does it. An edit to a row or column the other branch deleted is a conflict. A chart or pivot the other branch edited still comes over, but is flagged so you can check its ranges.
 - **Charts, images, comments, macros**: 3-way merge object by object. If only their branch changed a chart, you get their version. If both did, yours is kept and it's flagged as a conflict. Chart edits caused by cell changes (Excel caches plotted values inside the chart) don't count as edits.
 - **Tables**: merged field by field. Their new column plus your new rows gives a table with both. Tables added on their branch come over, and if both branches added a `Table2`, theirs is renamed `Table3` and their formulas are updated to match.
 - **Pivot tables**: a pivot, its data cache and the cached records merge as one bundle. A branch that only refreshed a pivot (same layout, new data) doesn't count as an edit, so your data change and their "switch to Average" merge cleanly. New pivots from their branch come over, sharing an existing cache when they used one.
@@ -202,7 +209,7 @@ fuzz/fetch_corpus.sh corpus            # ~17,000 workbooks: Enron corpus + open-
 python fuzz/merge_fuzz.py corpus --keep failed/
 ```
 
-`--keep` saves the base, ours, theirs and merged files of every failure. `--rounds N` tries N different random edits per workbook.
+`--keep` saves the base, ours, theirs and merged files of every failure. `--rounds N` tries N different random edits per workbook. `--mode rows` and `--mode cols` have one branch insert or delete rows or columns, the way Excel would, while both edit cells; the expected result is worked out by the fuzzer, independently of xlgit.
 
 ## Limits
 
@@ -211,14 +218,14 @@ python fuzz/merge_fuzz.py corpus --keep failed/
 - Until Excel refreshes a merged pivot, the numbers in its cells are the old ones. Excel does this on open, but tools that read the file without Excel (pandas, openpyxl) see the stale values.
 - Slicers, timelines and tables linked to external data connections aren't merged. They're reported as conflicts so nothing disappears silently.
 - If both branches added a chart to a sheet that had none, only yours is kept (flagged).
-- Inserted and deleted rows are followed when only one branch changed a sheet's rows. If both branches inserted or deleted rows on the same sheet, that sheet merges cell by cell, and cells that only moved can show up as conflicts.
-- Rows are recognised by their contents. A row change can't always be recognised (say, deleting one of many identical rows); then the sheet merges cell by cell and anything unclear is reported as a conflict, never guessed.
-- Inserted columns show as changed cells for now.
+- Inserted and deleted rows (and columns) are followed when only one branch changed a sheet's rows (columns). If both branches inserted or deleted rows or columns on the same sheet, or one branch did both, that sheet merges cell by cell, and cells that only moved can show up as conflicts.
+- Rows and columns are recognised by their contents. A change can't always be recognised (say, deleting one of many identical rows); then the sheet merges cell by cell and anything unclear is reported as a conflict, never guessed.
+- A chart or pivot table edited on one branch, on a sheet where the other branch moved rows or columns, comes over with its ranges as that branch wrote them. It's flagged as a conflict so you can check them.
 - `.xls` (the old pre-2007 format) isn't supported. Save as `.xlsx`.
 
 ## Roadmap
 
-Done so far: fuzz testing against real workbooks and following inserted, deleted and moved rows. Next up: code review for spreadsheets: showing what a change does to the numbers, tests that run on every pull request, and a linter. See [ROADMAP.md](https://github.com/MichaelFowler1/excel-git/blob/main/ROADMAP.md).
+Done so far: fuzz testing against real workbooks and following inserted, deleted and moved rows and columns. Next up: code review for spreadsheets: showing what a change does to the numbers, tests that run on every pull request, and a linter. See [ROADMAP.md](https://github.com/MichaelFowler1/excel-git/blob/main/ROADMAP.md).
 
 ## License
 
